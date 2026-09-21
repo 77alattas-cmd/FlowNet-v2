@@ -93,7 +93,6 @@ jobs:
               implementation platform('androidx.compose:compose-bom:2024.09.03')
               implementation 'androidx.compose.ui:ui'
               implementation 'androidx.compose.material3:material3'
-              implementation 'androidx.compose.material:material-icons-extended'
           }
           EOF
           
@@ -102,6 +101,9 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <application
                   android:allowBackup="true"
                   android:label="FlowNet"
@@ -114,16 +116,232 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <service
+                      android:name=".FileServerService"
+                      android:foregroundServiceType="dataSync"
+                      android:exported="false" />
               </application>
           </manifest>
+          EOF
+          
+          cat > app/src/main/java/com/flownet/app/FileServerService.kt << 'EOF'
+          package com.flownet.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.IBinder
+          import android.provider.OpenableColumns
+          import androidx.core.app.NotificationCompat
+          import java.io.OutputStream
+          import java.net.ServerSocket
+          import java.net.Socket
+
+          class FileServerService : Service() {
+
+              private var serverSocket: ServerSocket? = null
+              private var serverThread: Thread? = null
+              private var files: List<Uri> = emptyList()
+              private var port: Int = 8080
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  port = intent?.getIntExtra("port", 8080) ?: 8080
+                  val fileStrings = intent?.getStringArrayListExtra("files") ?: arrayListOf()
+                  files = fileStrings.map { Uri.parse(it) }
+
+                  startForeground(NOTIFICATION_ID, createNotification())
+
+                  serverThread?.interrupt()
+                  serverSocket?.close()
+
+                  serverThread = Thread {
+                      try {
+                          serverSocket = ServerSocket(port)
+                          while (!Thread.currentThread().isInterrupted) {
+                              val client = serverSocket?.accept() ?: break
+                              Thread { handleClient(client) }.start()
+                          }
+                      } catch (e: Exception) {
+                          e.printStackTrace()
+                      }
+                  }.also { it.start() }
+
+                  return START_STICKY
+              }
+
+              private fun handleClient(socket: Socket) {
+                  socket.use { sock ->
+                      try {
+                          val reader = sock.getInputStream().bufferedReader()
+                          val requestLine = reader.readLine() ?: return
+                          val parts = requestLine.split(" ")
+                          if (parts.size < 2) return
+                          val path = parts[1]
+
+                          val output = sock.getOutputStream()
+
+                          when {
+                              path == "/" || path == "/index.html" -> {
+                                  val html = generateIndexHtml()
+                                  val bytes = html.toByteArray(Charsets.UTF_8)
+                                  val header = "HTTP/1.1 200 OK\r\n" +
+                                          "Content-Type: text/html; charset=utf-8\r\n" +
+                                          "Content-Length: ${bytes.size}\r\n" +
+                                          "Connection: close\r\n\r\n"
+                                  output.write(header.toByteArray())
+                                  output.write(bytes)
+                              }
+                              path.startsWith("/file/") -> {
+                                  val index = path.removePrefix("/file/").toIntOrNull()
+                                  if (index != null && index in files.indices) {
+                                      serveFile(output, files[index])
+                                  } else {
+                                      sendNotFound(output)
+                                  }
+                              }
+                              else -> sendNotFound(output)
+                          }
+                          output.flush()
+                      } catch (e: Exception) {
+                          e.printStackTrace()
+                      }
+                  }
+              }
+
+              private fun serveFile(output: OutputStream, uri: Uri) {
+                  try {
+                      val inputStream = contentResolver.openInputStream(uri)
+                      if (inputStream == null) {
+                          sendNotFound(output)
+                          return
+                      }
+                      val fileName = getFileName(uri)
+                      val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+                      val bytes = inputStream.use { it.readBytes() }
+
+                      val header = "HTTP/1.1 200 OK\r\n" +
+                              "Content-Type: $mimeType\r\n" +
+                              "Content-Length: ${bytes.size}\r\n" +
+                              "Content-Disposition: attachment; filename=\"$fileName\"\r\n" +
+                              "Connection: close\r\n\r\n"
+                      output.write(header.toByteArray())
+                      output.write(bytes)
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                  }
+              }
+
+              private fun getFileName(uri: Uri): String {
+                  var name = "file"
+                  try {
+                      contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                          if (cursor.moveToFirst()) {
+                              val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                              if (nameIndex >= 0) {
+                                  name = cursor.getString(nameIndex) ?: "file"
+                              }
+                          }
+                      }
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                  }
+                  return name
+              }
+
+              private fun generateIndexHtml(): String {
+                  val fileListHtml = files.mapIndexed { index, uri ->
+                      val name = getFileName(uri)
+                      "<li><a href=\"/file/$index\">📄 $name</a></li>"
+                  }.joinToString("\n")
+
+                  val bodyContent = if (files.isEmpty()) {
+                      "<p class='empty'>لا توجد ملفات مشتركة حالياً</p>"
+                  } else {
+                      "<ul>$fileListHtml</ul>"
+                  }
+
+                  return "<!DOCTYPE html>" +
+                          "<html dir='rtl'>" +
+                          "<head>" +
+                          "<meta charset='utf-8'>" +
+                          "<meta name='viewport' content='width=device-width, initial-scale=1'>" +
+                          "<title>FlowNet</title>" +
+                          "<style>" +
+                          "body { font-family: system-ui, sans-serif; background: #f4f7fc; margin: 0; padding: 20px; }" +
+                          "h1 { color: #3182ce; }" +
+                          ".card { background: white; border-radius: 16px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }" +
+                          "ul { list-style: none; padding: 0; }" +
+                          "li { padding: 14px; margin: 8px 0; background: #f8fafc; border-radius: 10px; }" +
+                          "a { color: #1e293b; text-decoration: none; font-weight: bold; }" +
+                          "a:hover { color: #3182ce; }" +
+                          ".empty { color: #94a3b8; text-align: center; padding: 40px; }" +
+                          "</style>" +
+                          "</head>" +
+                          "<body>" +
+                          "<div class='card'>" +
+                          "<h1>🌐 FlowNet</h1>" +
+                          "<p>الملفات المتاحة للمشاركة:</p>" +
+                          bodyContent +
+                          "</div>" +
+                          "</body>" +
+                          "</html>"
+              }
+
+              private fun sendNotFound(output: OutputStream) {
+                  val msg = "404 Not Found"
+                  val response = "HTTP/1.1 404 Not Found\r\nContent-Length: ${msg.length}\r\n\r\n$msg"
+                  output.write(response.toByteArray())
+              }
+
+              private fun createNotification(): Notification {
+                  val channelId = "flownet_server"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(
+                          channelId,
+                          "FlowNet Server",
+                          NotificationManager.IMPORTANCE_LOW
+                      )
+                      val nm = getSystemService(NotificationManager::class.java)
+                      nm.createNotificationChannel(channel)
+                  }
+                  return NotificationCompat.Builder(this, channelId)
+                      .setContentTitle("FlowNet يعمل")
+                      .setContentText("خادم الملفات نشط على المنفذ $port")
+                      .setSmallIcon(android.R.drawable.ic_menu_share)
+                      .setOngoing(true)
+                      .build()
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onDestroy() {
+                  serverThread?.interrupt()
+                  try { serverSocket?.close() } catch (e: Exception) {}
+                  super.onDestroy()
+              }
+
+              companion object {
+                  private const val NOTIFICATION_ID = 1001
+              }
+          }
           EOF
           
           cat > app/src/main/java/com/flownet/app/MainActivity.kt << 'EOF'
           package com.flownet.app
 
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
           import android.os.Bundle
+          import android.provider.OpenableColumns
           import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.RoundedCornerShape
@@ -134,6 +352,7 @@ jobs:
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
@@ -153,8 +372,18 @@ jobs:
 
           @Composable
           fun FlowNetScreen() {
+              val context = LocalContext.current
               var isRunning by rememberSaveable { mutableStateOf(false) }
+              var selectedFiles by remember { mutableStateOf<List<Uri>>(emptyList()) }
               val localIp = remember { getLocalIpAddress() }
+
+              val filePicker = rememberLauncherForActivityResult(
+                  contract = ActivityResultContracts.OpenMultipleDocuments()
+              ) { uris ->
+                  if (uris.isNotEmpty()) {
+                      selectedFiles = selectedFiles + uris
+                  }
+              }
 
               Surface(
                   modifier = Modifier.fillMaxSize(),
@@ -175,7 +404,7 @@ jobs:
                       )
 
                       Text(
-                          text = "مشاركة الإنترنت مع الأصدقاء",
+                          text = "مشاركة الملفات مع الأصدقاء",
                           fontSize = 14.sp,
                           color = Color(0xFF64748B)
                       )
@@ -202,7 +431,7 @@ jobs:
                               )
                               Spacer(Modifier.height(4.dp))
                               Text(
-                                  text = "المنفذ: 8080",
+                                  text = "الرابط: http://$localIp:8080",
                                   color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
                                   fontSize = 14.sp
                               )
@@ -210,17 +439,84 @@ jobs:
                       }
 
                       Button(
-                          onClick = { isRunning = !isRunning },
+                          onClick = { filePicker.launch(arrayOf("*/*")) },
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .height(52.dp),
+                          shape = RoundedCornerShape(12.dp),
+                          colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3182CE))
+                      ) {
+                          Text("📁 اختر ملفات للمشاركة", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                      }
+
+                      if (selectedFiles.isNotEmpty()) {
+                          Card(
+                              modifier = Modifier.fillMaxWidth(),
+                              shape = RoundedCornerShape(16.dp),
+                              colors = CardDefaults.cardColors(containerColor = Color.White)
+                          ) {
+                              Column(modifier = Modifier.padding(16.dp)) {
+                                  Text(
+                                      text = "الملفات المشتركة (${selectedFiles.size})",
+                                      fontSize = 14.sp,
+                                      fontWeight = FontWeight.Bold,
+                                      color = Color(0xFF1E293B)
+                                  )
+                                  Spacer(Modifier.height(8.dp))
+                                  selectedFiles.forEachIndexed { index, uri ->
+                                      Row(
+                                          modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                                          horizontalArrangement = Arrangement.SpaceBetween,
+                                          verticalAlignment = Alignment.CenterVertically
+                                      ) {
+                                          Text(
+                                              text = "📄 ${getFileName(context, uri).take(30)}",
+                                              fontSize = 12.sp,
+                                              color = Color(0xFF64748B),
+                                              modifier = Modifier.weight(1f)
+                                          )
+                                          TextButton(onClick = {
+                                              selectedFiles = selectedFiles.filterIndexed { i, _ -> i != index }
+                                          }) {
+                                              Text("حذف", fontSize = 11.sp, color = Color(0xFFE53E3E))
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+
+                      Button(
+                          onClick = {
+                              if (isRunning) {
+                                  context.stopService(Intent(context, FileServerService::class.java))
+                                  isRunning = false
+                              } else {
+                                  if (selectedFiles.isEmpty()) return@Button
+                                  val intent = Intent(context, FileServerService::class.java).apply {
+                                      putStringArrayListExtra("files", ArrayList(selectedFiles.map { it.toString() }))
+                                      putExtra("port", 8080)
+                                  }
+                                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                      context.startForegroundService(intent)
+                                  } else {
+                                      context.startService(intent)
+                                  }
+                                  isRunning = true
+                              }
+                          },
+                          enabled = isRunning || selectedFiles.isNotEmpty(),
                           modifier = Modifier
                               .fillMaxWidth()
                               .height(56.dp),
                           shape = RoundedCornerShape(12.dp),
                           colors = ButtonDefaults.buttonColors(
-                              containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169)
+                              containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169),
+                              disabledContainerColor = Color(0xFFCBD5E0)
                           )
                       ) {
                           Text(
-                              text = if (isRunning) "إيقاف الخدمة" else "تشغيل الخدمة",
+                              text = if (isRunning) "إيقاف الخدمة" else "🚀 تشغيل الخدمة",
                               fontSize = 16.sp,
                               fontWeight = FontWeight.Bold
                           )
@@ -234,7 +530,7 @@ jobs:
                           ) {
                               Column(modifier = Modifier.padding(20.dp)) {
                                   Text(
-                                      text = "كيف يتصل أصدقاؤك؟",
+                                      text = "كيف يشارك أصدقاؤك؟",
                                       fontSize = 16.sp,
                                       fontWeight = FontWeight.Bold,
                                       color = Color(0xFF1E293B)
@@ -242,10 +538,9 @@ jobs:
                                   Spacer(Modifier.height(12.dp))
                                   Text(
                                       text = "1. فعّل نقطة اتصال (Hotspot) على جوالك\n\n" +
-                                             "2. اطلب من صديقك الاتصال بنفس الشبكة\n\n" +
-                                             "3. في تطبيق البروكسي على جهازه، أدخل:\n" +
-                                             "   IP: $localIp\n" +
-                                             "   Port: 8080",
+                                              "2. اطلب من صديقك الاتصال بنفس الشبكة\n\n" +
+                                              "3. اطلب منه فتح المتصفح على:\n" +
+                                              "   http://$localIp:8080",
                                       fontSize = 13.sp,
                                       color = Color(0xFF64748B),
                                       lineHeight = 22.sp
@@ -254,10 +549,8 @@ jobs:
                           }
                       }
 
-                      Spacer(Modifier.height(8.dp))
-
                       Text(
-                          text = "ملاحظة: هذه نسخة تجريبية. الخدمة الحقيقية ستُضاف في الخطوة القادمة.",
+                          text = "الملفات تُرسل عبر شبكتك المحلية فقط. لا يُرسل شيء للإنترنت.",
                           fontSize = 11.sp,
                           color = Color(0xFF94A3B8)
                       )
@@ -265,26 +558,37 @@ jobs:
               }
           }
 
+          fun getFileName(context: android.content.Context, uri: Uri): String {
+              var name = "file"
+              try {
+                  context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                      if (cursor.moveToFirst()) {
+                          val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                          if (idx >= 0) name = cursor.getString(idx) ?: "file"
+                      }
+                  }
+              } catch (e: Exception) {}
+              return name
+          }
+
           fun getLocalIpAddress(): String {
               try {
                   val interfaces = NetworkInterface.getNetworkInterfaces() ?: return "غير متاح"
                   while (interfaces.hasMoreElements()) {
-                      val networkInterface = interfaces.nextElement()
-                      if (!networkInterface.isUp || networkInterface.isLoopback) continue
-                      val addresses = networkInterface.inetAddresses
+                      val iface = interfaces.nextElement()
+                      if (!iface.isUp || iface.isLoopback) continue
+                      val addresses = iface.inetAddresses
                       while (addresses.hasMoreElements()) {
-                          val address = addresses.nextElement()
-                          if (!address.isLoopbackAddress && address is Inet4Address) {
-                              val ip = address.hostAddress ?: continue
+                          val addr = addresses.nextElement()
+                          if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                              val ip = addr.hostAddress ?: continue
                               if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) {
                                   return ip
                               }
                           }
                       }
                   }
-              } catch (e: Exception) {
-                  // Ignore
-              }
+              } catch (e: Exception) {}
               return "غير متاح"
           }
           EOF
