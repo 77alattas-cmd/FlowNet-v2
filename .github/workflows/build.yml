@@ -343,7 +343,7 @@ jobs:
                           val methods = ByteArray(nMethods)
                           input.read(methods)
 
-                          output.write(byteArrayOf(0x05, 0x00))
+                          output.write(byteArrayOf(0x05.toByte(), 0x00.toByte()))
                           output.flush()
 
                           val ver2 = input.read()
@@ -352,7 +352,7 @@ jobs:
                           val atyp = input.read()
                           if (ver2 != 0x05) return
                           if (cmd != 0x01) {
-                              output.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                              output.write(byteArrayOf(0x05.toByte(), 0x07.toByte(), 0x00.toByte(), 0x01.toByte(), 0, 0, 0, 0, 0, 0))
                               output.flush()
                               return
                           }
@@ -380,7 +380,7 @@ jobs:
                           try {
                               target = Socket()
                               target.connect(InetSocketAddress(host, targetPort), 10000)
-                              output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                              output.write(byteArrayOf(0x05.toByte(), 0x00.toByte(), 0x00.toByte(), 0x01.toByte(), 0, 0, 0, 0, 0, 0))
                               output.flush()
 
                               val t1 = Thread { relay(sock.getInputStream(), target.getOutputStream()) }
@@ -389,7 +389,7 @@ jobs:
                               t1.join(); t2.join()
                           } catch (e: Exception) {
                               try {
-                                  output.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                                  output.write(byteArrayOf(0x05.toByte(), 0x05.toByte(), 0x00.toByte(), 0x01.toByte(), 0, 0, 0, 0, 0, 0))
                                   output.flush()
                               } catch (ex: Exception) {}
                           } finally {
@@ -757,13 +757,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: FlowNet-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: warn
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: FlowNet-debug-apk
+          name: FlowNet-apk-${{ github.run_number }}
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
