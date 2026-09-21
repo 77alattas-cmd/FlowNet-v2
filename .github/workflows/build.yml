@@ -93,12 +93,15 @@ jobs:
               implementation platform('androidx.compose:compose-bom:2024.09.03')
               implementation 'androidx.compose.ui:ui'
               implementation 'androidx.compose.material3:material3'
+              implementation 'androidx.compose.material:material-icons-extended'
           }
           EOF
           
           cat > app/src/main/AndroidManifest.xml << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
               <application
                   android:allowBackup="true"
                   android:label="FlowNet"
@@ -122,36 +125,167 @@ jobs:
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
           import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
           import androidx.compose.material3.*
-          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.*
+          import androidx.compose.runtime.saveable.rememberSaveable
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import java.net.Inet4Address
+          import java.net.NetworkInterface
 
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   setContent {
                       MaterialTheme {
-                          Surface(modifier = Modifier.fillMaxSize()) {
-                              Greeting()
-                          }
+                          FlowNetScreen()
                       }
                   }
               }
           }
 
           @Composable
-          fun Greeting() {
-              Column(
+          fun FlowNetScreen() {
+              var isRunning by rememberSaveable { mutableStateOf(false) }
+              val localIp = remember { getLocalIpAddress() }
+
+              Surface(
                   modifier = Modifier.fillMaxSize(),
-                  verticalArrangement = Arrangement.Center,
-                  horizontalAlignment = Alignment.CenterHorizontally
+                  color = Color(0xFFF4F7FC)
               ) {
-                  Text(text = "FlowNet", style = MaterialTheme.typography.headlineLarge)
-                  Spacer(modifier = Modifier.height(8.dp))
-                  Text(text = "قيد البناء...")
+                  Column(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .verticalScroll(rememberScrollState())
+                          .padding(20.dp),
+                      verticalArrangement = Arrangement.spacedBy(16.dp)
+                  ) {
+                      Text(
+                          text = "FlowNet",
+                          fontSize = 28.sp,
+                          fontWeight = FontWeight.Bold,
+                          color = Color(0xFF1E293B)
+                      )
+
+                      Text(
+                          text = "مشاركة الإنترنت مع الأصدقاء",
+                          fontSize = 14.sp,
+                          color = Color(0xFF64748B)
+                      )
+
+                      Card(
+                          modifier = Modifier.fillMaxWidth(),
+                          shape = RoundedCornerShape(16.dp),
+                          colors = CardDefaults.cardColors(
+                              containerColor = if (isRunning) Color(0xFF3182CE) else Color.White
+                          )
+                      ) {
+                          Column(modifier = Modifier.padding(20.dp)) {
+                              Text(
+                                  text = if (isRunning) "الخدمة تعمل" else "الخدمة متوقفة",
+                                  color = if (isRunning) Color.White else Color(0xFF1E293B),
+                                  fontSize = 20.sp,
+                                  fontWeight = FontWeight.Bold
+                              )
+                              Spacer(Modifier.height(12.dp))
+                              Text(
+                                  text = "IP المحلي: $localIp",
+                                  color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
+                                  fontSize = 14.sp
+                              )
+                              Spacer(Modifier.height(4.dp))
+                              Text(
+                                  text = "المنفذ: 8080",
+                                  color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
+                                  fontSize = 14.sp
+                              )
+                          }
+                      }
+
+                      Button(
+                          onClick = { isRunning = !isRunning },
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .height(56.dp),
+                          shape = RoundedCornerShape(12.dp),
+                          colors = ButtonDefaults.buttonColors(
+                              containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169)
+                          )
+                      ) {
+                          Text(
+                              text = if (isRunning) "إيقاف الخدمة" else "تشغيل الخدمة",
+                              fontSize = 16.sp,
+                              fontWeight = FontWeight.Bold
+                          )
+                      }
+
+                      if (isRunning) {
+                          Card(
+                              modifier = Modifier.fillMaxWidth(),
+                              shape = RoundedCornerShape(16.dp),
+                              colors = CardDefaults.cardColors(containerColor = Color.White)
+                          ) {
+                              Column(modifier = Modifier.padding(20.dp)) {
+                                  Text(
+                                      text = "كيف يتصل أصدقاؤك؟",
+                                      fontSize = 16.sp,
+                                      fontWeight = FontWeight.Bold,
+                                      color = Color(0xFF1E293B)
+                                  )
+                                  Spacer(Modifier.height(12.dp))
+                                  Text(
+                                      text = "1. فعّل نقطة اتصال (Hotspot) على جوالك\n\n" +
+                                             "2. اطلب من صديقك الاتصال بنفس الشبكة\n\n" +
+                                             "3. في تطبيق البروكسي على جهازه، أدخل:\n" +
+                                             "   IP: $localIp\n" +
+                                             "   Port: 8080",
+                                      fontSize = 13.sp,
+                                      color = Color(0xFF64748B),
+                                      lineHeight = 22.sp
+                                  )
+                              }
+                          }
+                      }
+
+                      Spacer(Modifier.height(8.dp))
+
+                      Text(
+                          text = "ملاحظة: هذه نسخة تجريبية. الخدمة الحقيقية ستُضاف في الخطوة القادمة.",
+                          fontSize = 11.sp,
+                          color = Color(0xFF94A3B8)
+                      )
+                  }
               }
+          }
+
+          fun getLocalIpAddress(): String {
+              try {
+                  val interfaces = NetworkInterface.getNetworkInterfaces() ?: return "غير متاح"
+                  while (interfaces.hasMoreElements()) {
+                      val networkInterface = interfaces.nextElement()
+                      if (!networkInterface.isUp || networkInterface.isLoopback) continue
+                      val addresses = networkInterface.inetAddresses
+                      while (addresses.hasMoreElements()) {
+                          val address = addresses.nextElement()
+                          if (!address.isLoopbackAddress && address is Inet4Address) {
+                              val ip = address.hostAddress ?: continue
+                              if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) {
+                                  return ip
+                              }
+                          }
+                      }
+                  }
+              } catch (e: Exception) {
+                  // Ignore
+              }
+              return "غير متاح"
           }
           EOF
           
