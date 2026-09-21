@@ -107,7 +107,8 @@ jobs:
               <application
                   android:allowBackup="true"
                   android:label="FlowNet"
-                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:usesCleartextTraffic="true">
                   <activity
                       android:name=".MainActivity"
                       android:exported="true">
@@ -120,11 +121,15 @@ jobs:
                       android:name=".FileServerService"
                       android:foregroundServiceType="dataSync"
                       android:exported="false" />
+                  <service
+                      android:name=".Socks5ProxyService"
+                      android:foregroundServiceType="dataSync"
+                      android:exported="false" />
               </application>
           </manifest>
           EOF
           
-          cat > app/src/main/java/com/flownet/app/FileServerService.kt << 'EOF'
+          cat > app/src/main/java/com/flownet/app/Socks5ProxyService.kt << 'EOF'
           package com.flownet.app
 
           import android.app.Notification
@@ -132,38 +137,37 @@ jobs:
           import android.app.NotificationManager
           import android.app.Service
           import android.content.Intent
-          import android.net.Uri
           import android.os.Build
           import android.os.IBinder
-          import android.provider.OpenableColumns
           import androidx.core.app.NotificationCompat
+          import java.io.InputStream
           import java.io.OutputStream
+          import java.net.InetAddress
+          import java.net.InetSocketAddress
           import java.net.ServerSocket
           import java.net.Socket
+          import java.util.concurrent.Executors
 
-          class FileServerService : Service() {
+          class Socks5ProxyService : Service() {
 
               private var serverSocket: ServerSocket? = null
               private var serverThread: Thread? = null
-              private var files: List<Uri> = emptyList()
-              private var port: Int = 8080
+              private var port: Int = 1080
+              private val pool = Executors.newCachedThreadPool()
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  port = intent?.getIntExtra("port", 8080) ?: 8080
-                  val fileStrings = intent?.getStringArrayListExtra("files") ?: arrayListOf()
-                  files = fileStrings.map { Uri.parse(it) }
-
+                  port = intent?.getIntExtra("port", 1080) ?: 1080
                   startForeground(NOTIFICATION_ID, createNotification())
 
+                  try { serverSocket?.close() } catch (e: Exception) {}
                   serverThread?.interrupt()
-                  serverSocket?.close()
 
                   serverThread = Thread {
                       try {
                           serverSocket = ServerSocket(port)
                           while (!Thread.currentThread().isInterrupted) {
                               val client = serverSocket?.accept() ?: break
-                              Thread { handleClient(client) }.start()
+                              pool.execute { handleClient(client) }
                           }
                       } catch (e: Exception) {
                           e.printStackTrace()
@@ -173,144 +177,101 @@ jobs:
                   return START_STICKY
               }
 
-              private fun handleClient(socket: Socket) {
-                  socket.use { sock ->
-                      try {
-                          val reader = sock.getInputStream().bufferedReader()
-                          val requestLine = reader.readLine() ?: return
-                          val parts = requestLine.split(" ")
-                          if (parts.size < 2) return
-                          val path = parts[1]
-
+              private fun handleClient(client: Socket) {
+                  try {
+                      client.use { sock ->
+                          sock.soTimeout = 30000
+                          val input = sock.getInputStream()
                           val output = sock.getOutputStream()
 
-                          when {
-                              path == "/" || path == "/index.html" -> {
-                                  val html = generateIndexHtml()
-                                  val bytes = html.toByteArray(Charsets.UTF_8)
-                                  val header = "HTTP/1.1 200 OK\r\n" +
-                                          "Content-Type: text/html; charset=utf-8\r\n" +
-                                          "Content-Length: ${bytes.size}\r\n" +
-                                          "Connection: close\r\n\r\n"
-                                  output.write(header.toByteArray())
-                                  output.write(bytes)
-                              }
-                              path.startsWith("/file/") -> {
-                                  val index = path.removePrefix("/file/").toIntOrNull()
-                                  if (index != null && index in files.indices) {
-                                      serveFile(output, files[index])
-                                  } else {
-                                      sendNotFound(output)
-                                  }
-                              }
-                              else -> sendNotFound(output)
-                          }
+                          val ver = input.read()
+                          if (ver != 0x05) return
+                          val nMethods = input.read()
+                          if (nMethods <= 0) return
+                          val methods = ByteArray(nMethods)
+                          input.read(methods)
+
+                          output.write(byteArrayOf(0x05, 0x00))
                           output.flush()
-                      } catch (e: Exception) {
-                          e.printStackTrace()
-                      }
-                  }
-              }
 
-              private fun serveFile(output: OutputStream, uri: Uri) {
-                  try {
-                      val inputStream = contentResolver.openInputStream(uri)
-                      if (inputStream == null) {
-                          sendNotFound(output)
-                          return
-                      }
-                      val fileName = getFileName(uri)
-                      val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
-                      val bytes = inputStream.use { it.readBytes() }
+                          val ver2 = input.read()
+                          val cmd = input.read()
+                          input.read()
+                          val atyp = input.read()
+                          if (ver2 != 0x05) return
+                          if (cmd != 0x01) {
+                              output.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                              output.flush()
+                              return
+                          }
 
-                      val header = "HTTP/1.1 200 OK\r\n" +
-                              "Content-Type: $mimeType\r\n" +
-                              "Content-Length: ${bytes.size}\r\n" +
-                              "Content-Disposition: attachment; filename=\"$fileName\"\r\n" +
-                              "Connection: close\r\n\r\n"
-                      output.write(header.toByteArray())
-                      output.write(bytes)
-                  } catch (e: Exception) {
-                      e.printStackTrace()
-                  }
-              }
-
-              private fun getFileName(uri: Uri): String {
-                  var name = "file"
-                  try {
-                      contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                          if (cursor.moveToFirst()) {
-                              val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                              if (nameIndex >= 0) {
-                                  name = cursor.getString(nameIndex) ?: "file"
+                          val host: String
+                          when (atyp) {
+                              0x01 -> {
+                                  val addr = ByteArray(4); input.read(addr)
+                                  host = addr.joinToString(".") { (it.toInt() and 0xFF).toString() }
                               }
+                              0x03 -> {
+                                  val len = input.read()
+                                  val domain = ByteArray(len); input.read(domain)
+                                  host = String(domain, Charsets.UTF_8)
+                              }
+                              0x04 -> {
+                                  val addr = ByteArray(16); input.read(addr)
+                                  host = InetAddress.getByAddress(addr).hostAddress ?: return
+                              }
+                              else -> return
+                          }
+                          val port = (input.read() shl 8) or input.read()
+
+                          var target: Socket? = null
+                          try {
+                              target = Socket()
+                              target.connect(InetSocketAddress(host, port), 10000)
+                              output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                              output.flush()
+
+                              val t1 = Thread { relay(sock.getInputStream(), target.getOutputStream()) }
+                              val t2 = Thread { relay(target.getInputStream(), sock.getOutputStream()) }
+                              t1.start(); t2.start()
+                              t1.join(); t2.join()
+                          } catch (e: Exception) {
+                              try {
+                                  output.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                                  output.flush()
+                              } catch (ex: Exception) {}
+                          } finally {
+                              try { target?.close() } catch (e: Exception) {}
                           }
                       }
                   } catch (e: Exception) {
                       e.printStackTrace()
                   }
-                  return name
               }
 
-              private fun generateIndexHtml(): String {
-                  val fileListHtml = files.mapIndexed { index, uri ->
-                      val name = getFileName(uri)
-                      "<li><a href=\"/file/$index\">📄 $name</a></li>"
-                  }.joinToString("\n")
-
-                  val bodyContent = if (files.isEmpty()) {
-                      "<p class='empty'>لا توجد ملفات مشتركة حالياً</p>"
-                  } else {
-                      "<ul>$fileListHtml</ul>"
-                  }
-
-                  return "<!DOCTYPE html>" +
-                          "<html dir='rtl'>" +
-                          "<head>" +
-                          "<meta charset='utf-8'>" +
-                          "<meta name='viewport' content='width=device-width, initial-scale=1'>" +
-                          "<title>FlowNet</title>" +
-                          "<style>" +
-                          "body { font-family: system-ui, sans-serif; background: #f4f7fc; margin: 0; padding: 20px; }" +
-                          "h1 { color: #3182ce; }" +
-                          ".card { background: white; border-radius: 16px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }" +
-                          "ul { list-style: none; padding: 0; }" +
-                          "li { padding: 14px; margin: 8px 0; background: #f8fafc; border-radius: 10px; }" +
-                          "a { color: #1e293b; text-decoration: none; font-weight: bold; }" +
-                          "a:hover { color: #3182ce; }" +
-                          ".empty { color: #94a3b8; text-align: center; padding: 40px; }" +
-                          "</style>" +
-                          "</head>" +
-                          "<body>" +
-                          "<div class='card'>" +
-                          "<h1>🌐 FlowNet</h1>" +
-                          "<p>الملفات المتاحة للمشاركة:</p>" +
-                          bodyContent +
-                          "</div>" +
-                          "</body>" +
-                          "</html>"
-              }
-
-              private fun sendNotFound(output: OutputStream) {
-                  val msg = "404 Not Found"
-                  val response = "HTTP/1.1 404 Not Found\r\nContent-Length: ${msg.length}\r\n\r\n$msg"
-                  output.write(response.toByteArray())
+              private fun relay(input: InputStream, output: OutputStream) {
+                  try {
+                      val buf = ByteArray(8192)
+                      while (!Thread.currentThread().isInterrupted) {
+                          val n = input.read(buf)
+                          if (n <= 0) break
+                          output.write(buf, 0, n)
+                          output.flush()
+                      }
+                  } catch (e: Exception) {}
               }
 
               private fun createNotification(): Notification {
-                  val channelId = "flownet_server"
+                  val channelId = "flownet_proxy"
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                       val channel = NotificationChannel(
-                          channelId,
-                          "FlowNet Server",
-                          NotificationManager.IMPORTANCE_LOW
+                          channelId, "FlowNet Proxy", NotificationManager.IMPORTANCE_LOW
                       )
-                      val nm = getSystemService(NotificationManager::class.java)
-                      nm.createNotificationChannel(channel)
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
                   }
                   return NotificationCompat.Builder(this, channelId)
-                      .setContentTitle("FlowNet يعمل")
-                      .setContentText("خادم الملفات نشط على المنفذ $port")
+                      .setContentTitle("FlowNet Proxy يعمل")
+                      .setContentText("SOCKS5 على المنفذ $port")
                       .setSmallIcon(android.R.drawable.ic_menu_share)
                       .setOngoing(true)
                       .build()
@@ -321,11 +282,12 @@ jobs:
               override fun onDestroy() {
                   serverThread?.interrupt()
                   try { serverSocket?.close() } catch (e: Exception) {}
+                  pool.shutdownNow()
                   super.onDestroy()
               }
 
               companion object {
-                  private const val NOTIFICATION_ID = 1001
+                  private const val NOTIFICATION_ID = 1002
               }
           }
           EOF
@@ -372,6 +334,28 @@ jobs:
 
           @Composable
           fun FlowNetScreen() {
+              var tab by rememberSaveable { mutableIntStateOf(0) }
+              Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFFF4F7FC)) {
+                  Column(modifier = Modifier.fillMaxSize()) {
+                      TabRow(
+                          selectedTabIndex = tab,
+                          containerColor = Color.White
+                      ) {
+                          Tab(selected = tab == 0, onClick = { tab = 0 },
+                              text = { Text("📁 الملفات", fontSize = 14.sp) })
+                          Tab(selected = tab == 1, onClick = { tab = 1 },
+                              text = { Text("🌐 البروكسي", fontSize = 14.sp) })
+                      }
+                      when (tab) {
+                          0 -> FileSharingScreen()
+                          1 -> ProxyScreen()
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun FileSharingScreen() {
               val context = LocalContext.current
               var isRunning by rememberSaveable { mutableStateOf(false) }
               var selectedFiles by remember { mutableStateOf<List<Uri>>(emptyList()) }
@@ -379,181 +363,200 @@ jobs:
 
               val filePicker = rememberLauncherForActivityResult(
                   contract = ActivityResultContracts.OpenMultipleDocuments()
-              ) { uris ->
-                  if (uris.isNotEmpty()) {
-                      selectedFiles = selectedFiles + uris
-                  }
-              }
+              ) { uris -> if (uris.isNotEmpty()) selectedFiles = selectedFiles + uris }
 
-              Surface(
-                  modifier = Modifier.fillMaxSize(),
-                  color = Color(0xFFF4F7FC)
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .verticalScroll(rememberScrollState())
+                      .padding(20.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp)
               ) {
-                  Column(
-                      modifier = Modifier
-                          .fillMaxSize()
-                          .verticalScroll(rememberScrollState())
-                          .padding(20.dp),
-                      verticalArrangement = Arrangement.spacedBy(16.dp)
+                  Text("مشاركة الملفات", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+
+                  Card(
+                      modifier = Modifier.fillMaxWidth(),
+                      shape = RoundedCornerShape(16.dp),
+                      colors = CardDefaults.cardColors(
+                          containerColor = if (isRunning) Color(0xFF3182CE) else Color.White
+                      )
                   ) {
-                      Text(
-                          text = "FlowNet",
-                          fontSize = 28.sp,
-                          fontWeight = FontWeight.Bold,
-                          color = Color(0xFF1E293B)
-                      )
+                      Column(modifier = Modifier.padding(20.dp)) {
+                          Text(
+                              if (isRunning) "الخدمة تعمل" else "الخدمة متوقفة",
+                              color = if (isRunning) Color.White else Color(0xFF1E293B),
+                              fontSize = 18.sp, fontWeight = FontWeight.Bold
+                          )
+                          Spacer(Modifier.height(8.dp))
+                          Text(
+                              "http://$localIp:8080",
+                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
+                              fontSize = 13.sp
+                          )
+                      }
+                  }
 
-                      Text(
-                          text = "مشاركة الملفات مع الأصدقاء",
-                          fontSize = 14.sp,
-                          color = Color(0xFF64748B)
-                      )
+                  Button(
+                      onClick = { filePicker.launch(arrayOf("*/*")) },
+                      modifier = Modifier.fillMaxWidth().height(52.dp),
+                      shape = RoundedCornerShape(12.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3182CE))
+                  ) { Text("📁 اختر ملفات", fontSize = 15.sp) }
 
+                  if (selectedFiles.isNotEmpty()) {
+                      Text("الملفات (${selectedFiles.size})", fontSize = 14.sp,
+                          fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                      selectedFiles.forEachIndexed { i, uri ->
+                          Row(modifier = Modifier.fillMaxWidth(),
+                              horizontalArrangement = Arrangement.SpaceBetween,
+                              verticalAlignment = Alignment.CenterVertically) {
+                              Text(getFileName(context, uri).take(28),
+                                  fontSize = 12.sp, color = Color(0xFF64748B),
+                                  modifier = Modifier.weight(1f))
+                              TextButton(onClick = {
+                                  selectedFiles = selectedFiles.filterIndexed { j, _ -> j != i }
+                              }) { Text("حذف", fontSize = 11.sp, color = Color(0xFFE53E3E)) }
+                          }
+                      }
+                  }
+
+                  Button(
+                      onClick = {
+                          if (isRunning) {
+                              context.stopService(Intent(context, FileServerService::class.java))
+                              isRunning = false
+                          } else {
+                              if (selectedFiles.isEmpty()) return@Button
+                              val i = Intent(context, FileServerService::class.java).apply {
+                                  putStringArrayListExtra("files", ArrayList(selectedFiles.map { it.toString() }))
+                                  putExtra("port", 8080)
+                              }
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                                  context.startForegroundService(i) else context.startService(i)
+                              isRunning = true
+                          }
+                      },
+                      enabled = isRunning || selectedFiles.isNotEmpty(),
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      shape = RoundedCornerShape(12.dp),
+                      colors = ButtonDefaults.buttonColors(
+                          containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169),
+                          disabledContainerColor = Color(0xFFCBD5E0)
+                      )
+                  ) { Text(if (isRunning) "إيقاف الخدمة" else "🚀 تشغيل", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+              }
+          }
+
+          @Composable
+          fun ProxyScreen() {
+              val context = LocalContext.current
+              var isRunning by rememberSaveable { mutableStateOf(false) }
+              var port by rememberSaveable { mutableStateOf("1080") }
+              val localIp = remember { getLocalIpAddress() }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .verticalScroll(rememberScrollState())
+                      .padding(20.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp)
+              ) {
+                  Text("بروكسي SOCKS5", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                  Text("شارك الإنترنت مع أصدقائك", fontSize = 13.sp, color = Color(0xFF64748B))
+
+                  Card(
+                      modifier = Modifier.fillMaxWidth(),
+                      shape = RoundedCornerShape(16.dp),
+                      colors = CardDefaults.cardColors(
+                          containerColor = if (isRunning) Color(0xFF3182CE) else Color.White
+                      )
+                  ) {
+                      Column(modifier = Modifier.padding(20.dp)) {
+                          Text(
+                              if (isRunning) "البروكسي يعمل" else "البروكسي متوقف",
+                              color = if (isRunning) Color.White else Color(0xFF1E293B),
+                              fontSize = 20.sp, fontWeight = FontWeight.Bold
+                          )
+                          Spacer(Modifier.height(12.dp))
+                          Text("IP: $localIp",
+                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
+                              fontSize = 14.sp)
+                          Spacer(Modifier.height(4.dp))
+                          Text("Port: $port",
+                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
+                              fontSize = 14.sp)
+                      }
+                  }
+
+                  OutlinedTextField(
+                      value = port,
+                      onValueChange = { port = it.filter { c -> c.isDigit() }.take(5) },
+                      label = { Text("منفذ البروكسي", fontSize = 12.sp) },
+                      modifier = Modifier.fillMaxWidth(),
+                      singleLine = true,
+                      enabled = !isRunning
+                  )
+
+                  Button(
+                      onClick = {
+                          if (isRunning) {
+                              context.stopService(Intent(context, Socks5ProxyService::class.java))
+                              isRunning = false
+                          } else {
+                              val p = port.toIntOrNull() ?: 1080
+                              val i = Intent(context, Socks5ProxyService::class.java).apply {
+                                  putExtra("port", p)
+                              }
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                                  context.startForegroundService(i) else context.startService(i)
+                              isRunning = true
+                          }
+                      },
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      shape = RoundedCornerShape(12.dp),
+                      colors = ButtonDefaults.buttonColors(
+                          containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169)
+                      )
+                  ) { Text(if (isRunning) "إيقاف البروكسي" else "🚀 تشغيل البروكسي", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+
+                  if (isRunning) {
                       Card(
                           modifier = Modifier.fillMaxWidth(),
                           shape = RoundedCornerShape(16.dp),
-                          colors = CardDefaults.cardColors(
-                              containerColor = if (isRunning) Color(0xFF3182CE) else Color.White
-                          )
+                          colors = CardDefaults.cardColors(containerColor = Color.White)
                       ) {
                           Column(modifier = Modifier.padding(20.dp)) {
-                              Text(
-                                  text = if (isRunning) "الخدمة تعمل" else "الخدمة متوقفة",
-                                  color = if (isRunning) Color.White else Color(0xFF1E293B),
-                                  fontSize = 20.sp,
-                                  fontWeight = FontWeight.Bold
-                              )
+                              Text("كيف يستخدمه أصدقاؤك؟", fontSize = 16.sp,
+                                  fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
                               Spacer(Modifier.height(12.dp))
                               Text(
-                                  text = "IP المحلي: $localIp",
-                                  color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
-                                  fontSize = 14.sp
+                                  "1. فعّل نقطة اتصال (Hotspot)\n\n" +
+                                  "2. صديقك يتصل بالشبكة\n\n" +
+                                  "3. في إعدادات Wi-Fi على جهازه:\n" +
+                                  "   • نوع البروكسي: SOCKS5\n" +
+                                  "   • IP: $localIp\n" +
+                                  "   • Port: $port\n\n" +
+                                  "4. يفتح المتصفح ويستمتع 🎉",
+                                  fontSize = 13.sp, color = Color(0xFF64748B), lineHeight = 22.sp
                               )
-                              Spacer(Modifier.height(4.dp))
+                          }
+                      }
+
+                      Card(
+                          modifier = Modifier.fillMaxWidth(),
+                          shape = RoundedCornerShape(12.dp),
+                          colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF5E6))
+                      ) {
+                          Column(modifier = Modifier.padding(14.dp)) {
+                              Text("💡 ملاحظة", fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                                  color = Color(0xFFDD6B20))
                               Text(
-                                  text = "الرابط: http://$localIp:8080",
-                                  color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
-                                  fontSize = 14.sp
+                                  "هذا البروكسي يعمل مع التطبيقات التي تدعم SOCKS5 (مثل المتصفحات). " +
+                                  "لمشاركة كل الإنترنت تلقائياً، سنضيف VpnService لاحقاً.",
+                                  fontSize = 11.sp, color = Color(0xFF92400E), lineHeight = 18.sp
                               )
                           }
                       }
-
-                      Button(
-                          onClick = { filePicker.launch(arrayOf("*/*")) },
-                          modifier = Modifier
-                              .fillMaxWidth()
-                              .height(52.dp),
-                          shape = RoundedCornerShape(12.dp),
-                          colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3182CE))
-                      ) {
-                          Text("📁 اختر ملفات للمشاركة", fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                      }
-
-                      if (selectedFiles.isNotEmpty()) {
-                          Card(
-                              modifier = Modifier.fillMaxWidth(),
-                              shape = RoundedCornerShape(16.dp),
-                              colors = CardDefaults.cardColors(containerColor = Color.White)
-                          ) {
-                              Column(modifier = Modifier.padding(16.dp)) {
-                                  Text(
-                                      text = "الملفات المشتركة (${selectedFiles.size})",
-                                      fontSize = 14.sp,
-                                      fontWeight = FontWeight.Bold,
-                                      color = Color(0xFF1E293B)
-                                  )
-                                  Spacer(Modifier.height(8.dp))
-                                  selectedFiles.forEachIndexed { index, uri ->
-                                      Row(
-                                          modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                                          horizontalArrangement = Arrangement.SpaceBetween,
-                                          verticalAlignment = Alignment.CenterVertically
-                                      ) {
-                                          Text(
-                                              text = "📄 ${getFileName(context, uri).take(30)}",
-                                              fontSize = 12.sp,
-                                              color = Color(0xFF64748B),
-                                              modifier = Modifier.weight(1f)
-                                          )
-                                          TextButton(onClick = {
-                                              selectedFiles = selectedFiles.filterIndexed { i, _ -> i != index }
-                                          }) {
-                                              Text("حذف", fontSize = 11.sp, color = Color(0xFFE53E3E))
-                                          }
-                                      }
-                                  }
-                              }
-                          }
-                      }
-
-                      Button(
-                          onClick = {
-                              if (isRunning) {
-                                  context.stopService(Intent(context, FileServerService::class.java))
-                                  isRunning = false
-                              } else {
-                                  if (selectedFiles.isEmpty()) return@Button
-                                  val intent = Intent(context, FileServerService::class.java).apply {
-                                      putStringArrayListExtra("files", ArrayList(selectedFiles.map { it.toString() }))
-                                      putExtra("port", 8080)
-                                  }
-                                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                      context.startForegroundService(intent)
-                                  } else {
-                                      context.startService(intent)
-                                  }
-                                  isRunning = true
-                              }
-                          },
-                          enabled = isRunning || selectedFiles.isNotEmpty(),
-                          modifier = Modifier
-                              .fillMaxWidth()
-                              .height(56.dp),
-                          shape = RoundedCornerShape(12.dp),
-                          colors = ButtonDefaults.buttonColors(
-                              containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169),
-                              disabledContainerColor = Color(0xFFCBD5E0)
-                          )
-                      ) {
-                          Text(
-                              text = if (isRunning) "إيقاف الخدمة" else "🚀 تشغيل الخدمة",
-                              fontSize = 16.sp,
-                              fontWeight = FontWeight.Bold
-                          )
-                      }
-
-                      if (isRunning) {
-                          Card(
-                              modifier = Modifier.fillMaxWidth(),
-                              shape = RoundedCornerShape(16.dp),
-                              colors = CardDefaults.cardColors(containerColor = Color.White)
-                          ) {
-                              Column(modifier = Modifier.padding(20.dp)) {
-                                  Text(
-                                      text = "كيف يشارك أصدقاؤك؟",
-                                      fontSize = 16.sp,
-                                      fontWeight = FontWeight.Bold,
-                                      color = Color(0xFF1E293B)
-                                  )
-                                  Spacer(Modifier.height(12.dp))
-                                  Text(
-                                      text = "1. فعّل نقطة اتصال (Hotspot) على جوالك\n\n" +
-                                              "2. اطلب من صديقك الاتصال بنفس الشبكة\n\n" +
-                                              "3. اطلب منه فتح المتصفح على:\n" +
-                                              "   http://$localIp:8080",
-                                      fontSize = 13.sp,
-                                      color = Color(0xFF64748B),
-                                      lineHeight = 22.sp
-                                  )
-                              }
-                          }
-                      }
-
-                      Text(
-                          text = "الملفات تُرسل عبر شبكتك المحلية فقط. لا يُرسل شيء للإنترنت.",
-                          fontSize = 11.sp,
-                          color = Color(0xFF94A3B8)
-                      )
                   }
               }
           }
@@ -561,10 +564,10 @@ jobs:
           fun getFileName(context: android.content.Context, uri: Uri): String {
               var name = "file"
               try {
-                  context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                      if (cursor.moveToFirst()) {
-                          val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                          if (idx >= 0) name = cursor.getString(idx) ?: "file"
+                  context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                      if (c.moveToFirst()) {
+                          val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                          if (i >= 0) name = c.getString(i) ?: "file"
                       }
                   }
               } catch (e: Exception) {}
@@ -577,14 +580,12 @@ jobs:
                   while (interfaces.hasMoreElements()) {
                       val iface = interfaces.nextElement()
                       if (!iface.isUp || iface.isLoopback) continue
-                      val addresses = iface.inetAddresses
-                      while (addresses.hasMoreElements()) {
-                          val addr = addresses.nextElement()
-                          if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                              val ip = addr.hostAddress ?: continue
-                              if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) {
-                                  return ip
-                              }
+                      val addrs = iface.inetAddresses
+                      while (addrs.hasMoreElements()) {
+                          val a = addrs.nextElement()
+                          if (!a.isLoopbackAddress && a is Inet4Address) {
+                              val ip = a.hostAddress ?: continue
+                              if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) return ip
                           }
                       }
                   }
@@ -598,6 +599,16 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
+      - name: Build Debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: FlowNet-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
       - name: Build Debug APK
         run: gradle assembleDebug --stacktrace
 
