@@ -129,6 +129,158 @@ jobs:
           </manifest>
           EOF
           
+          cat > app/src/main/java/com/flownet/app/FileServerService.kt << 'EOF'
+          package com.flownet.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.IBinder
+          import android.provider.OpenableColumns
+          import androidx.core.app.NotificationCompat
+          import java.io.OutputStream
+          import java.net.ServerSocket
+          import java.net.Socket
+
+          class FileServerService : Service() {
+
+              private var serverSocket: ServerSocket? = null
+              private var serverThread: Thread? = null
+              private var files: List<Uri> = emptyList()
+              private var port: Int = 8080
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  port = intent?.getIntExtra("port", 8080) ?: 8080
+                  val fileStrings = intent?.getStringArrayListExtra("files") ?: arrayListOf()
+                  files = fileStrings.map { Uri.parse(it) }
+
+                  startForeground(NOTIFICATION_ID, createNotification())
+
+                  serverThread?.interrupt()
+                  try { serverSocket?.close() } catch (e: Exception) {}
+
+                  serverThread = Thread {
+                      try {
+                          serverSocket = ServerSocket(port)
+                          while (!Thread.currentThread().isInterrupted) {
+                              val client = serverSocket?.accept() ?: break
+                              Thread { handleClient(client) }.start()
+                          }
+                      } catch (e: Exception) {
+                          e.printStackTrace()
+                      }
+                  }.also { it.start() }
+
+                  return START_STICKY
+              }
+
+              private fun handleClient(socket: Socket) {
+                  socket.use { sock ->
+                      try {
+                          val reader = sock.getInputStream().bufferedReader()
+                          val requestLine = reader.readLine() ?: return
+                          val parts = requestLine.split(" ")
+                          if (parts.size < 2) return
+                          val path = parts[1]
+                          val output = sock.getOutputStream()
+
+                          when {
+                              path == "/" || path == "/index.html" -> {
+                                  val html = generateIndexHtml()
+                                  val bytes = html.toByteArray(Charsets.UTF_8)
+                                  val header = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+                                  output.write(header.toByteArray())
+                                  output.write(bytes)
+                              }
+                              path.startsWith("/file/") -> {
+                                  val index = path.removePrefix("/file/").toIntOrNull()
+                                  if (index != null && index in files.indices) {
+                                      serveFile(output, files[index])
+                                  } else {
+                                      sendNotFound(output)
+                                  }
+                              }
+                              else -> sendNotFound(output)
+                          }
+                          output.flush()
+                      } catch (e: Exception) {
+                          e.printStackTrace()
+                      }
+                  }
+              }
+
+              private fun serveFile(output: OutputStream, uri: Uri) {
+                  try {
+                      val inputStream = contentResolver.openInputStream(uri)
+                      if (inputStream == null) { sendNotFound(output); return }
+                      val fileName = getFileName(uri)
+                      val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+                      val bytes = inputStream.use { it.readBytes() }
+                      val header = "HTTP/1.1 200 OK\r\nContent-Type: $mimeType\r\nContent-Length: ${bytes.size}\r\nContent-Disposition: attachment; filename=\"$fileName\"\r\nConnection: close\r\n\r\n"
+                      output.write(header.toByteArray())
+                      output.write(bytes)
+                  } catch (e: Exception) { e.printStackTrace() }
+              }
+
+              private fun getFileName(uri: Uri): String {
+                  var name = "file"
+                  try {
+                      contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                          if (cursor.moveToFirst()) {
+                              val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                              if (nameIndex >= 0) name = cursor.getString(nameIndex) ?: "file"
+                          }
+                      }
+                  } catch (e: Exception) {}
+                  return name
+              }
+
+              private fun generateIndexHtml(): String {
+                  val fileListHtml = files.mapIndexed { index, uri ->
+                      val name = getFileName(uri)
+                      "<li><a href=\"/file/$index\">📄 $name</a></li>"
+                  }.joinToString("\n")
+                  val bodyContent = if (files.isEmpty()) "<p class='empty'>لا توجد ملفات مشتركة</p>" else "<ul>$fileListHtml</ul>"
+                  return "<!DOCTYPE html><html dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>FlowNet</title><style>body{font-family:system-ui,sans-serif;background:#f4f7fc;margin:0;padding:20px}h1{color:#3182ce}.card{background:white;border-radius:16px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}ul{list-style:none;padding:0}li{padding:14px;margin:8px 0;background:#f8fafc;border-radius:10px}a{color:#1e293b;text-decoration:none;font-weight:bold}.empty{color:#94a3b8;text-align:center;padding:40px}</style></head><body><div class='card'><h1>🌐 FlowNet</h1><p>الملفات المتاحة:</p>$bodyContent</div></body></html>"
+              }
+
+              private fun sendNotFound(output: OutputStream) {
+                  val msg = "404 Not Found"
+                  output.write("HTTP/1.1 404 Not Found\r\nContent-Length: ${msg.length}\r\n\r\n$msg".toByteArray())
+              }
+
+              private fun createNotification(): Notification {
+                  val channelId = "flownet_server"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(channelId, "FlowNet Server", NotificationManager.IMPORTANCE_LOW)
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                  }
+                  return NotificationCompat.Builder(this, channelId)
+                      .setContentTitle("FlowNet يعمل")
+                      .setContentText("خادم الملفات على المنفذ $port")
+                      .setSmallIcon(android.R.drawable.ic_menu_share)
+                      .setOngoing(true)
+                      .build()
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onDestroy() {
+                  serverThread?.interrupt()
+                  try { serverSocket?.close() } catch (e: Exception) {}
+                  super.onDestroy()
+              }
+
+              companion object {
+                  private const val NOTIFICATION_ID = 1001
+              }
+          }
+          EOF
+          
           cat > app/src/main/java/com/flownet/app/Socks5ProxyService.kt << 'EOF'
           package com.flownet.app
 
@@ -222,12 +374,12 @@ jobs:
                               }
                               else -> return
                           }
-                          val port = (input.read() shl 8) or input.read()
+                          val targetPort = (input.read() shl 8) or input.read()
 
                           var target: Socket? = null
                           try {
                               target = Socket()
-                              target.connect(InetSocketAddress(host, port), 10000)
+                              target.connect(InetSocketAddress(host, targetPort), 10000)
                               output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                               output.flush()
 
@@ -551,8 +703,7 @@ jobs:
                               Text("💡 ملاحظة", fontSize = 12.sp, fontWeight = FontWeight.Bold,
                                   color = Color(0xFFDD6B20))
                               Text(
-                                  "هذا البروكسي يعمل مع التطبيقات التي تدعم SOCKS5 (مثل المتصفحات). " +
-                                  "لمشاركة كل الإنترنت تلقائياً، سنضيف VpnService لاحقاً.",
+                                  "هذا البروكسي يعمل مع التطبيقات التي تدعم SOCKS5 (مثل المتصفحات).",
                                   fontSize = 11.sp, color = Color(0xFF92400E), lineHeight = 18.sp
                               )
                           }
@@ -609,9 +760,6 @@ jobs:
           name: FlowNet-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
-      - name: Build Debug APK
-        run: gradle assembleDebug --stacktrace
-
       - name: Upload APK
         uses: actions/upload-artifact@v4
         if: always()
