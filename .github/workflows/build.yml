@@ -125,6 +125,10 @@ jobs:
                       android:name=".Socks5ProxyService"
                       android:foregroundServiceType="dataSync"
                       android:exported="false" />
+                  <service
+                      android:name=".HttpProxyService"
+                      android:foregroundServiceType="dataSync"
+                      android:exported="false" />
               </application>
           </manifest>
           EOF
@@ -151,10 +155,10 @@ jobs:
               private var serverSocket: ServerSocket? = null
               private var serverThread: Thread? = null
               private var files: List<Uri> = emptyList()
-              private var port: Int = 8080
+              private var port: Int = 8081
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  port = intent?.getIntExtra("port", 8080) ?: 8080
+                  port = intent?.getIntExtra("port", 8081) ?: 8081
                   val fileStrings = intent?.getStringArrayListExtra("files") ?: arrayListOf()
                   files = fileStrings.map { Uri.parse(it) }
 
@@ -414,16 +418,16 @@ jobs:
               }
 
               private fun createNotification(): Notification {
-                  val channelId = "flownet_proxy"
+                  val channelId = "flownet_socks5"
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                       val channel = NotificationChannel(
-                          channelId, "FlowNet Proxy", NotificationManager.IMPORTANCE_LOW
+                          channelId, "FlowNet SOCKS5", NotificationManager.IMPORTANCE_LOW
                       )
                       getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
                   }
                   return NotificationCompat.Builder(this, channelId)
-                      .setContentTitle("FlowNet Proxy يعمل")
-                      .setContentText("SOCKS5 على المنفذ $port")
+                      .setContentTitle("FlowNet SOCKS5 يعمل")
+                      .setContentText("المنفذ $port")
                       .setSmallIcon(android.R.drawable.ic_menu_share)
                       .setOngoing(true)
                       .build()
@@ -440,6 +444,181 @@ jobs:
 
               companion object {
                   private const val NOTIFICATION_ID = 1002
+              }
+          }
+          EOF
+          
+          cat > app/src/main/java/com/flownet/app/HttpProxyService.kt << 'EOF'
+          package com.flownet.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.os.Build
+          import android.os.IBinder
+          import androidx.core.app.NotificationCompat
+          import java.io.BufferedReader
+          import java.io.InputStream
+          import java.io.InputStreamReader
+          import java.io.OutputStream
+          import java.net.InetSocketAddress
+          import java.net.ServerSocket
+          import java.net.Socket
+          import java.net.URI
+          import java.util.concurrent.Executors
+
+          class HttpProxyService : Service() {
+
+              private var serverSocket: ServerSocket? = null
+              private var serverThread: Thread? = null
+              private var port: Int = 8080
+              private val pool = Executors.newCachedThreadPool()
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  port = intent?.getIntExtra("port", 8080) ?: 8080
+                  startForeground(NOTIFICATION_ID, createNotification())
+
+                  try { serverSocket?.close() } catch (e: Exception) {}
+                  serverThread?.interrupt()
+
+                  serverThread = Thread {
+                      try {
+                          serverSocket = ServerSocket(port)
+                          while (!Thread.currentThread().isInterrupted) {
+                              val client = serverSocket?.accept() ?: break
+                              pool.execute { handleClient(client) }
+                          }
+                      } catch (e: Exception) {
+                          e.printStackTrace()
+                      }
+                  }.also { it.start() }
+
+                  return START_STICKY
+              }
+
+              private fun handleClient(client: Socket) {
+                  try {
+                      client.use { sock ->
+                          sock.soTimeout = 60000
+                          val reader = BufferedReader(InputStreamReader(sock.getInputStream()))
+                          val output = sock.getOutputStream()
+
+                          val requestLine = reader.readLine() ?: return
+                          val parts = requestLine.split(" ")
+                          if (parts.size < 2) return
+
+                          val method = parts[0]
+                          val url = parts[1]
+
+                          // Read all headers
+                          val headers = mutableListOf<Pair<String, String>>()
+                          var line: String?
+                          while (true) {
+                              line = reader.readLine() ?: break
+                              if (line.isEmpty()) break
+                              val idx = line.indexOf(':')
+                              if (idx > 0) {
+                                  headers.add(line.substring(0, idx).trim() to line.substring(idx + 1).trim())
+                              }
+                          }
+
+                          if (method.equals("CONNECT", ignoreCase = true)) {
+                              // HTTPS tunnel
+                              val hostPort = url.split(":")
+                              val host = hostPort[0]
+                              val targetPort = hostPort.getOrNull(1)?.toIntOrNull() ?: 443
+
+                              val target = Socket()
+                              target.connect(InetSocketAddress(host, targetPort), 15000)
+                              output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+                              output.flush()
+
+                              val t1 = Thread { relay(sock.getInputStream(), target.getOutputStream()) }
+                              val t2 = Thread { relay(target.getInputStream(), sock.getOutputStream()) }
+                              t1.start(); t2.start()
+                              t1.join(); t2.join()
+
+                              try { target.close() } catch (e: Exception) {}
+                          } else {
+                              // Regular HTTP request
+                              val uri = URI(url)
+                              val host = uri.host ?: return
+                              val targetPort = if (uri.port > 0) uri.port else 80
+                              val path = (uri.rawPath ?: "/") + (uri.rawQuery?.let { "?$it" } ?: "")
+
+                              val target = Socket()
+                              target.connect(InetSocketAddress(host, targetPort), 15000)
+                              val targetOut = target.getOutputStream()
+
+                              // Build request for target
+                              val requestBuilder = StringBuilder()
+                              requestBuilder.append("$method $path HTTP/1.1\r\n")
+                              requestBuilder.append("Host: $host\r\n")
+
+                              headers.forEach { (k, v) ->
+                                  if (!k.equals("Proxy-Connection", ignoreCase = true) &&
+                                      !k.equals("Connection", ignoreCase = true)) {
+                                      requestBuilder.append("$k: $v\r\n")
+                                  }
+                              }
+                              requestBuilder.append("Connection: close\r\n")
+                              requestBuilder.append("\r\n")
+
+                              targetOut.write(requestBuilder.toString().toByteArray())
+                              targetOut.flush()
+
+                              // Relay response back
+                              relay(target.getInputStream(), output)
+
+                              try { target.close() } catch (e: Exception) {}
+                          }
+                      }
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                  }
+              }
+
+              private fun relay(input: InputStream, output: OutputStream) {
+                  try {
+                      val buf = ByteArray(8192)
+                      while (!Thread.currentThread().isInterrupted) {
+                          val n = input.read(buf)
+                          if (n <= 0) break
+                          output.write(buf, 0, n)
+                          output.flush()
+                      }
+                  } catch (e: Exception) {}
+              }
+
+              private fun createNotification(): Notification {
+                  val channelId = "flownet_http"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(
+                          channelId, "FlowNet HTTP Proxy", NotificationManager.IMPORTANCE_LOW
+                      )
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                  }
+                  return NotificationCompat.Builder(this, channelId)
+                      .setContentTitle("FlowNet HTTP Proxy يعمل")
+                      .setContentText("المنفذ $port")
+                      .setSmallIcon(android.R.drawable.ic_menu_share)
+                      .setOngoing(true)
+                      .build()
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onDestroy() {
+                  serverThread?.interrupt()
+                  try { serverSocket?.close() } catch (e: Exception) {}
+                  pool.shutdownNow()
+                  super.onDestroy()
+              }
+
+              companion object {
+                  private const val NOTIFICATION_ID = 1003
               }
           }
           EOF
@@ -494,13 +673,221 @@ jobs:
                           containerColor = Color.White
                       ) {
                           Tab(selected = tab == 0, onClick = { tab = 0 },
-                              text = { Text("📁 الملفات", fontSize = 14.sp) })
+                              text = { Text("🌐 HTTP", fontSize = 13.sp) })
                           Tab(selected = tab == 1, onClick = { tab = 1 },
-                              text = { Text("🌐 البروكسي", fontSize = 14.sp) })
+                              text = { Text("🔒 SOCKS5", fontSize = 13.sp) })
+                          Tab(selected = tab == 2, onClick = { tab = 2 },
+                              text = { Text("📁 ملفات", fontSize = 13.sp) })
                       }
                       when (tab) {
-                          0 -> FileSharingScreen()
-                          1 -> ProxyScreen()
+                          0 -> HttpProxyScreen()
+                          1 -> Socks5Screen()
+                          2 -> FileSharingScreen()
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun HttpProxyScreen() {
+              val context = LocalContext.current
+              var isRunning by rememberSaveable { mutableStateOf(false) }
+              val localIp = remember { getLocalIpAddress() }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .verticalScroll(rememberScrollState())
+                      .padding(20.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp)
+              ) {
+                  Text("HTTP Proxy", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                  Text("الأسهل والأسرع — كل التطبيقات تعمل تلقائياً", fontSize = 13.sp, color = Color(0xFF64748B))
+
+                  Card(
+                      modifier = Modifier.fillMaxWidth(),
+                      shape = RoundedCornerShape(16.dp),
+                      colors = CardDefaults.cardColors(
+                          containerColor = if (isRunning) Color(0xFF3182CE) else Color.White
+                      )
+                  ) {
+                      Column(modifier = Modifier.padding(20.dp)) {
+                          Text(
+                              if (isRunning) "البروكسي يعمل" else "البروكسي متوقف",
+                              color = if (isRunning) Color.White else Color(0xFF1E293B),
+                              fontSize = 20.sp, fontWeight = FontWeight.Bold
+                          )
+                          Spacer(Modifier.height(12.dp))
+                          Text("IP: $localIp",
+                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
+                              fontSize = 14.sp)
+                          Spacer(Modifier.height(4.dp))
+                          Text("Port: 8080",
+                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
+                              fontSize = 14.sp)
+                      }
+                  }
+
+                  Button(
+                      onClick = {
+                          if (isRunning) {
+                              context.stopService(Intent(context, HttpProxyService::class.java))
+                              isRunning = false
+                          } else {
+                              val i = Intent(context, HttpProxyService::class.java).apply {
+                                  putExtra("port", 8080)
+                              }
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                                  context.startForegroundService(i) else context.startService(i)
+                              isRunning = true
+                          }
+                      },
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      shape = RoundedCornerShape(12.dp),
+                      colors = ButtonDefaults.buttonColors(
+                          containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169)
+                      )
+                  ) { Text(if (isRunning) "إيقاف" else "🚀 تشغيل HTTP Proxy", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+
+                  if (isRunning) {
+                      Card(
+                          modifier = Modifier.fillMaxWidth(),
+                          shape = RoundedCornerShape(16.dp),
+                          colors = CardDefaults.cardColors(containerColor = Color.White)
+                      ) {
+                          Column(modifier = Modifier.padding(20.dp)) {
+                              Text("📱 كيف يستخدمه صديقك؟ (بدون أي تطبيق!)",
+                                  fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                              Spacer(Modifier.height(12.dp))
+                              Text(
+                                  "1. يتصل صديقك بـ Hotspot جوالك\n\n" +
+                                  "2. يفتح إعدادات Wi-Fi على جهازه\n\n" +
+                                  "3. يضغط مطولاً على اسم الشبكة → تعديل\n\n" +
+                                  "4. في قسم Proxy يختار: Manual\n\n" +
+                                  "5. يدخل:\n" +
+                                  "   • Hostname: $localIp\n" +
+                                  "   • Port: 8080\n\n" +
+                                  "6. يحفظ ✅\n\n" +
+                                  "7. الآن كل التطبيقات (Chrome، YouTube، Instagram) تعمل عبر بروكسي جوالك! 🎉",
+                                  fontSize = 12.sp, color = Color(0xFF64748B), lineHeight = 22.sp
+                              )
+                          }
+                      }
+
+                      Card(
+                          modifier = Modifier.fillMaxWidth(),
+                          shape = RoundedCornerShape(12.dp),
+                          colors = CardDefaults.cardColors(containerColor = Color(0xFFE6FFFA))
+                      ) {
+                          Column(modifier = Modifier.padding(14.dp)) {
+                              Text("✅ الأفضل لـ", fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                                  color = Color(0xFF2C7A7B))
+                              Text(
+                                  "• أندرويد (إعدادات Wi-Fi مدمجة)\n" +
+                                  "• Chrome وجميع المتصفحات\n" +
+                                  "• معظم التطبيقات\n" +
+                                  "• Windows / Mac (بدون تطبيقات إضافية)",
+                                  fontSize = 11.sp, color = Color(0xFF234E52), lineHeight = 18.sp
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun Socks5Screen() {
+              val context = LocalContext.current
+              var isRunning by rememberSaveable { mutableStateOf(false) }
+              var port by rememberSaveable { mutableStateOf("1080") }
+              val localIp = remember { getLocalIpAddress() }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .verticalScroll(rememberScrollState())
+                      .padding(20.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp)
+              ) {
+                  Text("SOCKS5 Proxy", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                  Text("للمتصفحات التي تدعم SOCKS5", fontSize = 13.sp, color = Color(0xFF64748B))
+
+                  Card(
+                      modifier = Modifier.fillMaxWidth(),
+                      shape = RoundedCornerShape(16.dp),
+                      colors = CardDefaults.cardColors(
+                          containerColor = if (isRunning) Color(0xFF3182CE) else Color.White
+                      )
+                  ) {
+                      Column(modifier = Modifier.padding(20.dp)) {
+                          Text(
+                              if (isRunning) "البروكسي يعمل" else "البروكسي متوقف",
+                              color = if (isRunning) Color.White else Color(0xFF1E293B),
+                              fontSize = 20.sp, fontWeight = FontWeight.Bold
+                          )
+                          Spacer(Modifier.height(12.dp))
+                          Text("IP: $localIp",
+                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
+                              fontSize = 14.sp)
+                          Spacer(Modifier.height(4.dp))
+                          Text("Port: $port",
+                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
+                              fontSize = 14.sp)
+                      }
+                  }
+
+                  OutlinedTextField(
+                      value = port,
+                      onValueChange = { port = it.filter { c -> c.isDigit() }.take(5) },
+                      label = { Text("منفذ SOCKS5", fontSize = 12.sp) },
+                      modifier = Modifier.fillMaxWidth(),
+                      singleLine = true,
+                      enabled = !isRunning
+                  )
+
+                  Button(
+                      onClick = {
+                          if (isRunning) {
+                              context.stopService(Intent(context, Socks5ProxyService::class.java))
+                              isRunning = false
+                          } else {
+                              val p = port.toIntOrNull() ?: 1080
+                              val i = Intent(context, Socks5ProxyService::class.java).apply {
+                                  putExtra("port", p)
+                              }
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                                  context.startForegroundService(i) else context.startService(i)
+                              isRunning = true
+                          }
+                      },
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      shape = RoundedCornerShape(12.dp),
+                      colors = ButtonDefaults.buttonColors(
+                          containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169)
+                      )
+                  ) { Text(if (isRunning) "إيقاف" else "🚀 تشغيل SOCKS5", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+
+                  if (isRunning) {
+                      Card(
+                          modifier = Modifier.fillMaxWidth(),
+                          shape = RoundedCornerShape(16.dp),
+                          colors = CardDefaults.cardColors(containerColor = Color.White)
+                      ) {
+                          Column(modifier = Modifier.padding(20.dp)) {
+                              Text("كيف يستخدمه صديقك؟", fontSize = 16.sp,
+                                  fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                              Spacer(Modifier.height(12.dp))
+                              Text(
+                                  "1. يتصل صديقك بـ Hotspot جوالك\n\n" +
+                                  "2. في Firefox على جهازه:\n" +
+                                  "   • الإعدادات → الشبكة → إعدادات الاتصال\n" +
+                                  "   • SOCKS Host: $localIp\n" +
+                                  "   • Port: $port\n" +
+                                  "   • SOCKS v5 ✓\n\n" +
+                                  "3. يفتح المتصفح ✅",
+                                  fontSize = 13.sp, color = Color(0xFF64748B), lineHeight = 22.sp
+                              )
+                          }
                       }
                   }
               }
@@ -541,7 +928,7 @@ jobs:
                           )
                           Spacer(Modifier.height(8.dp))
                           Text(
-                              "http://$localIp:8080",
+                              "http://$localIp:8081",
                               color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
                               fontSize = 13.sp
                           )
@@ -581,7 +968,7 @@ jobs:
                               if (selectedFiles.isEmpty()) return@Button
                               val i = Intent(context, FileServerService::class.java).apply {
                                   putStringArrayListExtra("files", ArrayList(selectedFiles.map { it.toString() }))
-                                  putExtra("port", 8080)
+                                  putExtra("port", 8081)
                               }
                               if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                                   context.startForegroundService(i) else context.startService(i)
@@ -596,119 +983,6 @@ jobs:
                           disabledContainerColor = Color(0xFFCBD5E0)
                       )
                   ) { Text(if (isRunning) "إيقاف الخدمة" else "🚀 تشغيل", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
-              }
-          }
-
-          @Composable
-          fun ProxyScreen() {
-              val context = LocalContext.current
-              var isRunning by rememberSaveable { mutableStateOf(false) }
-              var port by rememberSaveable { mutableStateOf("1080") }
-              val localIp = remember { getLocalIpAddress() }
-
-              Column(
-                  modifier = Modifier
-                      .fillMaxSize()
-                      .verticalScroll(rememberScrollState())
-                      .padding(20.dp),
-                  verticalArrangement = Arrangement.spacedBy(16.dp)
-              ) {
-                  Text("بروكسي SOCKS5", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
-                  Text("شارك الإنترنت مع أصدقائك", fontSize = 13.sp, color = Color(0xFF64748B))
-
-                  Card(
-                      modifier = Modifier.fillMaxWidth(),
-                      shape = RoundedCornerShape(16.dp),
-                      colors = CardDefaults.cardColors(
-                          containerColor = if (isRunning) Color(0xFF3182CE) else Color.White
-                      )
-                  ) {
-                      Column(modifier = Modifier.padding(20.dp)) {
-                          Text(
-                              if (isRunning) "البروكسي يعمل" else "البروكسي متوقف",
-                              color = if (isRunning) Color.White else Color(0xFF1E293B),
-                              fontSize = 20.sp, fontWeight = FontWeight.Bold
-                          )
-                          Spacer(Modifier.height(12.dp))
-                          Text("IP: $localIp",
-                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
-                              fontSize = 14.sp)
-                          Spacer(Modifier.height(4.dp))
-                          Text("Port: $port",
-                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
-                              fontSize = 14.sp)
-                      }
-                  }
-
-                  OutlinedTextField(
-                      value = port,
-                      onValueChange = { port = it.filter { c -> c.isDigit() }.take(5) },
-                      label = { Text("منفذ البروكسي", fontSize = 12.sp) },
-                      modifier = Modifier.fillMaxWidth(),
-                      singleLine = true,
-                      enabled = !isRunning
-                  )
-
-                  Button(
-                      onClick = {
-                          if (isRunning) {
-                              context.stopService(Intent(context, Socks5ProxyService::class.java))
-                              isRunning = false
-                          } else {
-                              val p = port.toIntOrNull() ?: 1080
-                              val i = Intent(context, Socks5ProxyService::class.java).apply {
-                                  putExtra("port", p)
-                              }
-                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                                  context.startForegroundService(i) else context.startService(i)
-                              isRunning = true
-                          }
-                      },
-                      modifier = Modifier.fillMaxWidth().height(56.dp),
-                      shape = RoundedCornerShape(12.dp),
-                      colors = ButtonDefaults.buttonColors(
-                          containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169)
-                      )
-                  ) { Text(if (isRunning) "إيقاف البروكسي" else "🚀 تشغيل البروكسي", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
-
-                  if (isRunning) {
-                      Card(
-                          modifier = Modifier.fillMaxWidth(),
-                          shape = RoundedCornerShape(16.dp),
-                          colors = CardDefaults.cardColors(containerColor = Color.White)
-                      ) {
-                          Column(modifier = Modifier.padding(20.dp)) {
-                              Text("كيف يستخدمه أصدقاؤك؟", fontSize = 16.sp,
-                                  fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
-                              Spacer(Modifier.height(12.dp))
-                              Text(
-                                  "1. فعّل نقطة اتصال (Hotspot)\n\n" +
-                                  "2. صديقك يتصل بالشبكة\n\n" +
-                                  "3. في إعدادات Wi-Fi على جهازه:\n" +
-                                  "   • نوع البروكسي: SOCKS5\n" +
-                                  "   • IP: $localIp\n" +
-                                  "   • Port: $port\n\n" +
-                                  "4. يفتح المتصفح ويستمتع 🎉",
-                                  fontSize = 13.sp, color = Color(0xFF64748B), lineHeight = 22.sp
-                              )
-                          }
-                      }
-
-                      Card(
-                          modifier = Modifier.fillMaxWidth(),
-                          shape = RoundedCornerShape(12.dp),
-                          colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF5E6))
-                      ) {
-                          Column(modifier = Modifier.padding(14.dp)) {
-                              Text("💡 ملاحظة", fontSize = 12.sp, fontWeight = FontWeight.Bold,
-                                  color = Color(0xFFDD6B20))
-                              Text(
-                                  "هذا البروكسي يعمل مع التطبيقات التي تدعم SOCKS5 (مثل المتصفحات).",
-                                  fontSize = 11.sp, color = Color(0xFF92400E), lineHeight = 18.sp
-                              )
-                          }
-                      }
-                  }
               }
           }
 
