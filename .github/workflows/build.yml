@@ -19,7 +19,7 @@ jobs:
           packages: 'platforms;android-34 build-tools;34.0.0 platform-tools'
       - name: Download and run script
         run: |
-          curl -L "https://gist.githubusercontent.com/77alattas-cmd/a38e4c9577b21e7d0795ab6daaaa11f5/raw/d10180faa507f21057cd82a0318166c8289f3595/script.sh" -o flow.sh
+          curl -L "https://gist.githubusercontent.com/77alattas-cmd/a38e4c9577b21e7d0795ab6daaaa11f5/raw/388c0892213bb673e508ffe129f3eeb83226ea9c/script.sh" -o flow.sh
           chmod +x flow.sh
           bash flow.sh
       - uses: gradle/actions/setup-gradle@v3
