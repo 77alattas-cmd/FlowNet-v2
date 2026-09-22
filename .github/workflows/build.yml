@@ -639,7 +639,7 @@ jobs:
           }
 
           @Composable
-          fun NavItem(selected: Boolean, label: String, icon: ImageVector, onClick: () -> Unit) {
+          fun RowScope.NavItem(selected: Boolean, label: String, icon: ImageVector, onClick: () -> Unit) {
               NavigationBarItem(
                   selected = selected,
                   onClick = onClick,
@@ -655,7 +655,6 @@ jobs:
               )
           }
 
-          // ============ الرئيسية ============
           @Composable
           fun HomeTab(httpRunning: Boolean, socksRunning: Boolean, filesRunning: Boolean, onNavigate: (Int) -> Unit) {
               Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
@@ -733,7 +732,6 @@ jobs:
               }
           }
 
-          // ============ الإعدادات ============
           @Composable
           fun SettingsTab(networks: List<NetworkIp>, onRefresh: () -> Unit) {
               var subtab by rememberSaveable { mutableIntStateOf(0) }
@@ -836,9 +834,9 @@ jobs:
                                   ) { Text("📶 إعدادات Hotspot", fontSize = 11.sp) }
                                   Button(
                                       onClick = {
-                                          val is = "DIRECT-FL-" + suffix.trim().ifEmpty { "Net" }
-                                          ssid = is; pass = password
-                                          qr = QrCodeGenerator.generateWifiQr(is, password)
+                                          val intended = "DIRECT-FL-" + suffix.trim().ifEmpty { "Net" }
+                                          ssid = intended; pass = password
+                                          qr = QrCodeGenerator.generateWifiQr(intended, password)
                                           info = "📷 الباركود معروض"
                                       },
                                       colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF805AD5)),
@@ -942,7 +940,6 @@ jobs:
               }
           }
 
-          // ============ HTTP ============
           @Composable
           fun HttpScreen(run: Boolean, nets: List<NetworkIp>, onR: () -> Unit, onChange: (Boolean) -> Unit) {
               val ctx = LocalContext.current
@@ -1046,7 +1043,6 @@ jobs:
               }
           }
 
-          // ============ مكونات مشتركة ============
           @Composable
           fun GradientHeader(title: String, subtitle: String, c1: Color, c2: Color) {
               Box(modifier = Modifier.fillMaxWidth().background(Brush.linearGradient(listOf(c1, c2))).padding(24.dp)) {
