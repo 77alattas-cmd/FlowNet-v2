@@ -268,8 +268,6 @@ jobs:
                   context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
               private var channel: WifiP2pManager.Channel? = null
 
-              fun isSupported(): Boolean = manager != null
-
               fun hasPermission(): Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                   ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
               } else {
@@ -360,11 +358,6 @@ jobs:
                           override fun onFailure(reason: Int) { onDone() }
                       })
                   } catch (e: Exception) { onDone() }
-              }
-
-              fun reset(onDone: () -> Unit = {}) {
-                  channel = null
-                  removeGroup { channel = ensureChannel(); onDone() }
               }
 
               private fun translate(r: Int): String = when (r) {
@@ -689,10 +682,6 @@ jobs:
           }
           EOF
           
-          echo "✅ الملفات الأساسية جاهزة"
-
-      - name: Create MainActivity
-        run: |
           cat > app/src/main/java/com/flownet/app/MainActivity.kt << 'EOF'
           package com.flownet.app
 
@@ -806,7 +795,6 @@ jobs:
 
                   OutlinedTextField(value = suffix, onValueChange = { suffix = it.take(15) },
                       label = { Text("اللاحقة", fontSize = 12.sp) },
-                      helperText = { Text("الاسم: DIRECT-FL-${suffix.ifEmpty { "Net" }}", fontSize = 10.sp) },
                       modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !isRunning)
 
                   OutlinedTextField(value = password, onValueChange = { password = it.take(30) },
@@ -1117,4 +1105,3 @@ jobs:
           name: FlowNet-apk-${{ github.run_number }}
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
-          
