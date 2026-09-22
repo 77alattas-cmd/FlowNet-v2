@@ -79,6 +79,7 @@ jobs:
               <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
               <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
               <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
@@ -202,16 +203,15 @@ jobs:
           import android.annotation.SuppressLint
           import android.content.Context
           import android.content.pm.PackageManager
-          import android.net.wifi.p2p.WifiP2pConfig
           import android.net.wifi.p2p.WifiP2pGroup
           import android.net.wifi.p2p.WifiP2pManager
           import android.os.Build
           import android.os.Handler
           import androidx.core.content.ContextCompat
-          import java.lang.reflect.Method
           class WifiDirectManager(private val context: Context) {
               private val manager: WifiP2pManager? = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
               private var channel: WifiP2pManager.Channel? = null
+              fun isSupported(): Boolean = manager != null
               fun hasPermission(): Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                   ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
               } else {
@@ -222,36 +222,34 @@ jobs:
                   return channel
               }
               @SuppressLint("MissingPermission")
-              fun createCustomGroup(suffix: String, password: String, onSuccess: (String, String) -> Unit, onFailure: (String) -> Unit) {
-                  val mgr = manager ?: return onFailure("WiFi Direct غير مدعوم على هذا الجهاز")
+              fun createGroupSimple(onSuccess: (String, String) -> Unit, onFailure: (String) -> Unit) {
+                  val mgr = manager ?: return onFailure("WiFi Direct غير متوفر")
                   if (!hasPermission()) return onFailure("يحتاج إذن WiFi Direct")
                   channel = null
                   val ch = ensureChannel() ?: return onFailure("فشل تهيئة القناة")
-                  val ssid = "DIRECT-FL-" + suffix.trim().replace(Regex("[^A-Za-z0-9_-]"), "").take(20).ifEmpty { "Net" }
-                  if (password.length < 8) return onFailure("كلمة المرور 8+ أحرف")
                   try {
                       mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
-                          override fun onSuccess() { doCreate(mgr, ch, ssid, password, onSuccess, onFailure) }
-                          override fun onFailure(reason: Int) { doCreate(mgr, ch, ssid, password, onSuccess, onFailure) }
+                          override fun onSuccess() { startCreate(mgr, ch, onSuccess, onFailure) }
+                          override fun onFailure(reason: Int) { startCreate(mgr, ch, onSuccess, onFailure) }
                       })
-                  } catch (e: Exception) { doCreate(mgr, ch, ssid, password, onSuccess, onFailure) }
+                  } catch (e: Exception) { startCreate(mgr, ch, onSuccess, onFailure) }
               }
-              private fun doCreate(mgr: WifiP2pManager, ch: WifiP2pManager.Channel, ssid: String, password: String, onSuccess: (String, String) -> Unit, onFailure: (String) -> Unit) {
+              private fun startCreate(mgr: WifiP2pManager, ch: WifiP2pManager.Channel, onSuccess: (String, String) -> Unit, onFailure: (String) -> Unit) {
                   try {
-                      val config = WifiP2pConfig.Builder().setNetworkName(ssid).setPassphrase(password).build()
-                      val method: Method = mgr.javaClass.getMethod("createGroup", WifiP2pManager.Channel::class.java, WifiP2pConfig::class.java, WifiP2pManager.ActionListener::class.java)
-                      method.invoke(mgr, ch, config, object : WifiP2pManager.ActionListener {
+                      mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
                           override fun onSuccess() {
                               Handler(context.mainLooper).postDelayed({
-                                  mgr.requestGroupInfo(ch) { group: WifiP2pGroup? ->
-                                      if (group == null) onFailure("لم يتم إنشاء المجموعة")
-                                      else onSuccess(group.networkName ?: ssid, group.passphrase ?: password)
-                                  }
-                              }, 2000)
+                                  try {
+                                      mgr.requestGroupInfo(ch) { group: WifiP2pGroup? ->
+                                          if (group == null) onFailure("تم القبول لكن لم تُنشأ المجموعة")
+                                          else onSuccess(group.networkName ?: "DIRECT-FL", group.passphrase ?: "12345678")
+                                      }
+                                  } catch (e: Exception) { onFailure("خطأ: ${e.message}") }
+                              }, 2500)
                           }
-                          override fun onFailure(reason: Int) { onFailure("MIUI يحجب WiFi Direct — استخدم Hotspot") }
+                          override fun onFailure(reason: Int) { onFailure(explainError(reason)) }
                       })
-                  } catch (e: Exception) { onFailure("MIUI يحجب WiFi Direct — استخدم Hotspot") }
+                  } catch (e: Exception) { onFailure("خطأ: ${e.message}") }
               }
               fun removeGroup(onDone: () -> Unit = {}) {
                   val mgr = manager ?: return onDone()
@@ -262,6 +260,12 @@ jobs:
                           override fun onFailure(reason: Int) { onDone() }
                       })
                   } catch (e: Exception) { onDone() }
+              }
+              private fun explainError(reason: Int): String = when (reason) {
+                  WifiP2pManager.BUSY -> "مشغول — أغلق Hotspot وانتظر"
+                  WifiP2pManager.ERROR -> "خطأ داخلي — أعد تشغيل WiFi"
+                  WifiP2pManager.P2P_UNSUPPORTED -> "غير مدعوم"
+                  else -> "فشل بكود $reason"
               }
           }
           EOF
@@ -552,7 +556,6 @@ jobs:
           import android.os.Build
           import android.os.Bundle
           import android.provider.OpenableColumns
-          import android.provider.Settings
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.compose.setContent
@@ -621,7 +624,7 @@ jobs:
                               NavItem(tab == 1, "HTTP", Icons.Rounded.Public) { tab = 1 }
                               NavItem(tab == 2, "SOCKS", Icons.Rounded.Lock) { tab = 2 }
                               NavItem(tab == 3, "ملفات", Icons.Rounded.Folder) { tab = 3 }
-                              NavItem(tab == 4, "الإعدادات", Icons.Rounded.Settings) { tab = 4 }
+                              NavItem(tab == 4, "Direct", Icons.Rounded.WifiTethering) { tab = 4 }
                           }
                       }
                   ) { padding ->
@@ -631,7 +634,7 @@ jobs:
                               1 -> HttpScreen(httpRunning, networks, { refresh++ }) { httpRunning = it }
                               2 -> SocksScreen(socksRunning, networks, { refresh++ }) { socksRunning = it }
                               3 -> FilesScreen(filesRunning, networks, { refresh++ }) { filesRunning = it }
-                              4 -> SettingsTab(networks, { refresh++ })
+                              4 -> DirectScreen(networks, { refresh++ })
                           }
                       }
                   }
@@ -658,12 +661,7 @@ jobs:
           @Composable
           fun HomeTab(httpRunning: Boolean, socksRunning: Boolean, filesRunning: Boolean, onNavigate: (Int) -> Unit) {
               Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                  Box(
-                      modifier = Modifier
-                          .fillMaxWidth()
-                          .background(Brush.linearGradient(listOf(Purple1, Purple2)))
-                          .padding(24.dp)
-                  ) {
+                  Box(modifier = Modifier.fillMaxWidth().background(Brush.linearGradient(listOf(Purple1, Purple2))).padding(24.dp)) {
                       Column {
                           Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                               Column {
@@ -684,16 +682,14 @@ jobs:
                           }
                       }
                   }
-
                   Spacer(Modifier.height(20.dp))
                   Text("الأدوات", modifier = Modifier.padding(horizontal = 24.dp), fontSize = 18.sp, fontWeight = FontWeight.Bold, color = TextDark)
                   Spacer(Modifier.height(12.dp))
-
                   Column(modifier = Modifier.padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                      FeatureCard("🌐", "HTTP Proxy", "المنفذ 8080 — الأسهل للكل", listOf(Orange1, Orange2), httpRunning) { onNavigate(1) }
+                      FeatureCard("🌐", "HTTP Proxy", "المنفذ 8080 — الأسهل", listOf(Orange1, Orange2), httpRunning) { onNavigate(1) }
                       FeatureCard("🔒", "SOCKS5 Proxy", "المنفذ 1080 — للمتصفحات", listOf(Purple1, Purple2), socksRunning) { onNavigate(2) }
-                      FeatureCard("📁", "مشاركة الملفات", "المنفذ 8081 — أرسل ملفاتك", listOf(Teal1, Teal2), filesRunning) { onNavigate(3) }
-                      FeatureCard("📡", "الشبكات والإعدادات", "WiFi Direct + Hotspot + إحصائيات", listOf(Pink1, Pink2), false) { onNavigate(4) }
+                      FeatureCard("📁", "مشاركة الملفات", "المنفذ 8081", listOf(Teal1, Teal2), filesRunning) { onNavigate(3) }
+                      FeatureCard("📡", "WiFi Direct", "شبكة DIRECT + باركود", listOf(Pink1, Pink2), false) { onNavigate(4) }
                   }
                   Spacer(Modifier.height(30.dp))
               }
@@ -733,35 +729,9 @@ jobs:
           }
 
           @Composable
-          fun SettingsTab(networks: List<NetworkIp>, onRefresh: () -> Unit) {
-              var subtab by rememberSaveable { mutableIntStateOf(0) }
-
-              Column(modifier = Modifier.fillMaxSize()) {
-                  Box(modifier = Modifier.fillMaxWidth().background(Brush.linearGradient(listOf(Pink1, Pink2))).padding(24.dp)) {
-                      Column {
-                          Text("الإعدادات", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
-                          Text("الشبكات والإحصائيات", color = Color.White.copy(alpha = 0.85f), fontSize = 13.sp)
-                      }
-                  }
-
-                  TabRow(selectedTabIndex = subtab, containerColor = Color.White) {
-                      Tab(selected = subtab == 0, onClick = { subtab = 0 }, text = { Text("📡 WiFi Direct", fontSize = 12.sp) })
-                      Tab(selected = subtab == 1, onClick = { subtab = 1 }, text = { Text("📊 إحصائيات", fontSize = 12.sp) })
-                  }
-
-                  when (subtab) {
-                      0 -> DirectTab(networks, onRefresh)
-                      1 -> StatsTab()
-                  }
-              }
-          }
-
-          @Composable
-          fun DirectTab(networks: List<NetworkIp>, onRefresh: () -> Unit) {
+          fun DirectScreen(networks: List<NetworkIp>, onRefresh: () -> Unit) {
               val context = LocalContext.current
               val mgr = remember { WifiDirectManager(context) }
-              var suffix by rememberSaveable { mutableStateOf("Net") }
-              var password by rememberSaveable { mutableStateOf("flownet123") }
               var isRunning by rememberSaveable { mutableStateOf(false) }
               var ssid by rememberSaveable { mutableStateOf("") }
               var pass by rememberSaveable { mutableStateOf("") }
@@ -771,171 +741,75 @@ jobs:
 
               val permL = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { g ->
                   if (g) {
-                      mgr.createCustomGroup(suffix, password, { s, p ->
-                          ssid = s; pass = p; isRunning = true; qr = QrCodeGenerator.generateWifiQr(s, p); err = null; info = "✅ الشبكة تعمل"; onRefresh()
+                      mgr.createGroupSimple({ s, p ->
+                          ssid = s; pass = p; isRunning = true
+                          qr = QrCodeGenerator.generateWifiQr(s, p)
+                          err = null; info = "✅ الشبكة تعمل"; onRefresh()
                       }, { e -> err = e })
                   } else err = "تم رفض الإذن"
               }
 
-              Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                  Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = if (isRunning) Purple1 else Color.White), elevation = CardDefaults.cardElevation(4.dp)) {
-                      Column(modifier = Modifier.padding(20.dp)) {
-                          Text(if (isRunning) "✅ الشبكة تعمل" else "⚪ WiFi Direct متوقف", color = if (isRunning) Color.White else TextDark, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                          if (isRunning) {
-                              Spacer(Modifier.height(10.dp))
-                              Text("SSID: $ssid", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                              Text("كلمة المرور: $pass", color = Color.White, fontSize = 14.sp)
-                          }
-                      }
-                  }
-
-                  OutlinedTextField(value = suffix, onValueChange = { suffix = it.take(15) }, label = { Text("اللاحقة", fontSize = 12.sp) }, modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !isRunning, shape = RoundedCornerShape(16.dp))
-                  OutlinedTextField(value = password, onValueChange = { password = it.take(30) }, label = { Text("كلمة المرور (8+)", fontSize = 12.sp) }, modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !isRunning, shape = RoundedCornerShape(16.dp))
-
-                  Button(
-                      onClick = {
-                          if (isRunning) {
-                              mgr.removeGroup { isRunning = false; ssid = ""; pass = ""; qr = null; info = null; err = null; onRefresh() }
-                          } else {
-                              err = null; info = null
-                              val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) Manifest.permission.NEARBY_WIFI_DEVICES else Manifest.permission.ACCESS_FINE_LOCATION
-                              if (mgr.hasPermission()) {
-                                  mgr.createCustomGroup(suffix, password, { s, p ->
-                                      ssid = s; pass = p; isRunning = true
-                                      qr = QrCodeGenerator.generateWifiQr(s, p)
-                                      err = null; info = "✅ الشبكة تعمل"; onRefresh()
-                                  }, { e -> err = e })
-                              } else permL.launch(perm)
-                          }
-                      },
-                      modifier = Modifier.fillMaxWidth().height(56.dp),
-                      shape = RoundedCornerShape(20.dp),
-                      colors = ButtonDefaults.buttonColors(containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF48BB78))
-                  ) { Text(if (isRunning) "إيقاف" else "🚀 تشغيل WiFi Direct", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
-
-                  if (err != null) {
-                      Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE5E5))) {
-                          Column(modifier = Modifier.padding(16.dp)) {
-                              Text("⚠️ $err", fontSize = 13.sp, color = Color(0xFF9B2C2C), fontWeight = FontWeight.Bold)
-                              Spacer(Modifier.height(10.dp))
-                              Text("💡 الحل: استخدم Hotspot بدلاً منه — يعمل على جميع الأجهزة.", fontSize = 12.sp, color = Color(0xFF9B2C2C), lineHeight = 18.sp)
-                              Spacer(Modifier.height(10.dp))
-                              Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                  Button(
-                                      onClick = {
-                                          try {
-                                              val i = Intent(Settings.ACTION_WIRELESS_SETTINGS)
-                                              i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                              context.startActivity(i)
-                                          } catch (e: Exception) {}
-                                      },
-                                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDD6B20)),
-                                      shape = RoundedCornerShape(12.dp)
-                                  ) { Text("📶 إعدادات Hotspot", fontSize = 11.sp) }
-                                  Button(
-                                      onClick = {
-                                          val intended = "DIRECT-FL-" + suffix.trim().ifEmpty { "Net" }
-                                          ssid = intended; pass = password
-                                          qr = QrCodeGenerator.generateWifiQr(intended, password)
-                                          info = "📷 الباركود معروض"
-                                      },
-                                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF805AD5)),
-                                      shape = RoundedCornerShape(12.dp)
-                                  ) { Text("📷 الباركود", fontSize = 11.sp) }
+              Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                  GradientHeader("WiFi Direct", "شبكة DIRECT + باركود", Pink1, Pink2)
+                  Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                      Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = if (isRunning) Purple1 else Color.White), elevation = CardDefaults.cardElevation(4.dp)) {
+                          Column(modifier = Modifier.padding(20.dp)) {
+                              Text(if (isRunning) "✅ الشبكة تعمل" else "⚪ WiFi Direct متوقف", color = if (isRunning) Color.White else TextDark, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                              if (isRunning) {
+                                  Spacer(Modifier.height(10.dp))
+                                  Text("SSID: $ssid", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                  Text("كلمة المرور: $pass", color = Color.White, fontSize = 14.sp)
                               }
                           }
                       }
-                  }
 
-                  if (info != null && err == null) {
-                      Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFE6FFFA))) {
-                          Text(info!!, modifier = Modifier.padding(16.dp), fontSize = 13.sp, color = Color(0xFF234E52), fontWeight = FontWeight.Bold)
-                      }
-                  }
+                      Button(
+                          onClick = {
+                              if (isRunning) {
+                                  mgr.removeGroup { isRunning = false; ssid = ""; pass = ""; qr = null; info = null; err = null; onRefresh() }
+                              } else {
+                                  err = null; info = null
+                                  val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) Manifest.permission.NEARBY_WIFI_DEVICES else Manifest.permission.ACCESS_FINE_LOCATION
+                                  if (mgr.hasPermission()) {
+                                      mgr.createGroupSimple({ s, p ->
+                                          ssid = s; pass = p; isRunning = true
+                                          qr = QrCodeGenerator.generateWifiQr(s, p)
+                                          err = null; info = "✅ الشبكة تعمل"; onRefresh()
+                                      }, { e -> err = e })
+                                  } else permL.launch(perm)
+                              }
+                          },
+                          modifier = Modifier.fillMaxWidth().height(56.dp),
+                          shape = RoundedCornerShape(20.dp),
+                          colors = ButtonDefaults.buttonColors(containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF48BB78))
+                      ) { Text(if (isRunning) "إيقاف" else "🚀 تشغيل WiFi Direct", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
 
-                  if (qr != null) {
-                      Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(6.dp)) {
-                          Column(modifier = Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                              Text("📷 امسح للاتصال", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = TextDark)
-                              Spacer(Modifier.height(16.dp))
-                              Image(bitmap = qr!!.asImageBitmap(), contentDescription = "QR", modifier = Modifier.size(240.dp).clip(RoundedCornerShape(16.dp)))
-                              Spacer(Modifier.height(16.dp))
-                              Text(ssid, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TextDark)
-                              Text("كلمة المرور: $pass", fontSize = 13.sp, color = TextGray)
+                      if (err != null) {
+                          Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE5E5))) {
+                              Text("⚠️ $err", modifier = Modifier.padding(16.dp), fontSize = 13.sp, color = Color(0xFF9B2C2C), fontWeight = FontWeight.Bold)
                           }
                       }
-                  }
 
-                  NetworksCard(networks, onRefresh)
-              }
-          }
+                      if (info != null && err == null) {
+                          Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFFE6FFFA))) {
+                              Text(info!!, modifier = Modifier.padding(16.dp), fontSize = 13.sp, color = Color(0xFF234E52), fontWeight = FontWeight.Bold)
+                          }
+                      }
 
-          @Composable
-          fun StatsTab() {
-              val ac by ProxyStats.activeConnections.collectAsState()
-              val br by ProxyStats.bytesReceived.collectAsState()
-              val bs by ProxyStats.bytesSent.collectAsState()
-              val tr by ProxyStats.totalRequests.collectAsState()
-              val rr by ProxyStats.recentRequests.collectAsState()
-              val dm by ProxyStats.devices.collectAsState()
-              val tf = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
-              val dl = remember(dm) { dm.values.sortedByDescending { it.lastSeen } }
-
-              Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                      StatCard("أجهزة", dl.size.toString(), "📱", Purple1, Modifier.weight(1f))
-                      StatCard("اتصالات", ac.toString(), "🔗", Pink1, Modifier.weight(1f))
-                  }
-                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                      StatCard("طلبات", tr.toString(), "🔢", Orange1, Modifier.weight(1f))
-                      StatCard("تنزيل", ProxyStats.formatBytes(br), "📥", Teal1, Modifier.weight(1f))
-                  }
-                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                      StatCard("رفع", ProxyStats.formatBytes(bs), "📤", Color(0xFFED8936), Modifier.weight(1f))
-                      Spacer(Modifier.weight(1f))
-                  }
-                  TextButton(onClick = { ProxyStats.reset() }, modifier = Modifier.align(Alignment.End)) {
-                      Text("🗑️ مسح", color = Color(0xFFE53E3E), fontSize = 12.sp)
-                  }
-                  if (dl.isNotEmpty()) {
-                      Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(4.dp)) {
-                          Column(modifier = Modifier.padding(16.dp)) {
-                              Text("📱 الأجهزة", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TextDark)
-                              Spacer(Modifier.height(10.dp))
-                              dl.forEach { d ->
-                                  Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
-                                      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                          Text("📱 ${d.ip}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = TextDark)
-                                          Text(tf.format(Date(d.lastSeen)), fontSize = 10.sp, color = TextGray)
-                                      }
-                                      Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                          Text("🔢 ${d.requestCount}", fontSize = 10.sp, color = TextGray)
-                                          Text("📥 ${ProxyStats.formatBytes(d.bytesReceived)}", fontSize = 10.sp, color = Color(0xFF38A169))
-                                          Text("📤 ${ProxyStats.formatBytes(d.bytesSent)}", fontSize = 10.sp, color = Color(0xFFED8936))
-                                      }
-                                  }
-                                  HorizontalDivider(color = Color(0xFFE2E8F0), thickness = 0.5.dp)
+                      if (qr != null) {
+                          Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(6.dp)) {
+                              Column(modifier = Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                  Text("📷 امسح للاتصال", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = TextDark)
+                                  Spacer(Modifier.height(16.dp))
+                                  Image(bitmap = qr!!.asImageBitmap(), contentDescription = "QR", modifier = Modifier.size(240.dp).clip(RoundedCornerShape(16.dp)))
+                                  Spacer(Modifier.height(16.dp))
+                                  Text(ssid, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TextDark)
+                                  Text("كلمة المرور: $pass", fontSize = 13.sp, color = TextGray)
                               }
                           }
                       }
-                  }
-                  if (rr.isNotEmpty()) {
-                      Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(4.dp)) {
-                          Column(modifier = Modifier.padding(16.dp)) {
-                              Text("📝 الطلبات", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TextDark)
-                              Spacer(Modifier.height(8.dp))
-                              rr.take(15).forEach { r ->
-                                  Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                                      Column(modifier = Modifier.weight(1f)) {
-                                          Text("${r.method} ${r.host}", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = TextDark)
-                                          Text(r.path.take(35), fontSize = 10.sp, color = TextGray)
-                                      }
-                                      Text(r.type, fontSize = 9.sp, fontWeight = FontWeight.Bold,
-                                           color = when (r.type) { "HTTP" -> Purple1; "SOCKS5" -> Pink1; "FILES" -> Teal1; else -> TextGray })
-                                  }
-                              }
-                          }
-                      }
+
+                      NetworksCard(networks, onRefresh)
                   }
               }
           }
@@ -1080,22 +954,6 @@ jobs:
               Button(onClick = onClick, modifier = Modifier.fillMaxWidth().height(60.dp), shape = RoundedCornerShape(20.dp),
                   colors = ButtonDefaults.buttonColors(containerColor = if (isOn) Color(0xFFE53E3E) else Color(0xFF48BB78))) {
                   Text(if (isOn) "⏹ إيقاف" else "🚀 تشغيل", fontSize = 16.sp, fontWeight = FontWeight.Bold)
-              }
-          }
-
-          @Composable
-          fun StatCard(title: String, value: String, icon: String, color: Color, modifier: Modifier = Modifier) {
-              Card(modifier = modifier.height(96.dp), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(4.dp)) {
-                  Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.SpaceBetween) {
-                      Row(verticalAlignment = Alignment.CenterVertically) {
-                          Box(modifier = Modifier.size(28.dp).clip(CircleShape).background(color.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
-                              Text(icon, fontSize = 14.sp)
-                          }
-                          Spacer(Modifier.width(6.dp))
-                          Text(title, fontSize = 11.sp, color = TextGray)
-                      }
-                      Text(value, fontSize = 18.sp, fontWeight = FontWeight.Bold, color = color)
-                  }
               }
           }
 
