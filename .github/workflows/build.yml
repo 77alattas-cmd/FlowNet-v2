@@ -309,10 +309,12 @@ jobs:
               private var serverSocket: ServerSocket? = null
               private var serverThread: Thread? = null
               private var port: Int = 1080
+              private var password: String = ""
               private val pool = Executors.newCachedThreadPool()
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   port = intent?.getIntExtra("port", 1080) ?: 1080
+                  password = intent?.getStringExtra("password") ?: ""
                   startForeground(NOTIFICATION_ID, createNotification())
 
                   try { serverSocket?.close() } catch (e: Exception) {}
@@ -347,8 +349,37 @@ jobs:
                           val methods = ByteArray(nMethods)
                           input.read(methods)
 
-                          output.write(byteArrayOf(0x05.toByte(), 0x00.toByte()))
-                          output.flush()
+                          // If password is set, require auth method 0x02
+                          if (password.isNotEmpty()) {
+                              val hasAuth = methods.any { it.toInt() == 0x02 }
+                              if (!hasAuth) {
+                                  output.write(byteArrayOf(0x05.toByte(), 0xFF.toByte()))
+                                  output.flush()
+                                  return
+                              }
+                              output.write(byteArrayOf(0x05.toByte(), 0x02.toByte()))
+                              output.flush()
+
+                              // RFC 1929 auth
+                              val authVer = input.read()
+                              if (authVer != 0x01) return
+                              val ulen = input.read()
+                              val uname = ByteArray(ulen); input.read(uname)
+                              val plen = input.read()
+                              val passwd = ByteArray(plen); input.read(passwd)
+                              val enteredPassword = String(passwd, Charsets.UTF_8)
+
+                              if (enteredPassword != password) {
+                                  output.write(byteArrayOf(0x01.toByte(), 0x01.toByte()))
+                                  output.flush()
+                                  return
+                              }
+                              output.write(byteArrayOf(0x01.toByte(), 0x00.toByte()))
+                              output.flush()
+                          } else {
+                              output.write(byteArrayOf(0x05.toByte(), 0x00.toByte()))
+                              output.flush()
+                          }
 
                           val ver2 = input.read()
                           val cmd = input.read()
@@ -467,6 +498,7 @@ jobs:
           import java.net.ServerSocket
           import java.net.Socket
           import java.net.URI
+          import java.util.Base64
           import java.util.concurrent.Executors
 
           class HttpProxyService : Service() {
@@ -474,10 +506,12 @@ jobs:
               private var serverSocket: ServerSocket? = null
               private var serverThread: Thread? = null
               private var port: Int = 8080
+              private var password: String = ""
               private val pool = Executors.newCachedThreadPool()
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   port = intent?.getIntExtra("port", 8080) ?: 8080
+                  password = intent?.getStringExtra("password") ?: ""
                   startForeground(NOTIFICATION_ID, createNotification())
 
                   try { serverSocket?.close() } catch (e: Exception) {}
@@ -513,13 +547,41 @@ jobs:
                           val url = parts[1]
 
                           val headers = mutableListOf<Pair<String, String>>()
+                          var proxyAuthHeader: String? = null
                           var line: String?
                           while (true) {
                               line = reader.readLine() ?: break
                               if (line.isEmpty()) break
                               val idx = line.indexOf(':')
                               if (idx > 0) {
-                                  headers.add(line.substring(0, idx).trim() to line.substring(idx + 1).trim())
+                                  val name = line.substring(0, idx).trim()
+                                  val value = line.substring(idx + 1).trim()
+                                  if (name.equals("Proxy-Authorization", ignoreCase = true)) {
+                                      proxyAuthHeader = value
+                                  } else {
+                                      headers.add(name to value)
+                                  }
+                              }
+                          }
+
+                          // Check auth
+                          if (password.isNotEmpty()) {
+                              var authenticated = false
+                              if (proxyAuthHeader != null && proxyAuthHeader.startsWith("Basic ", ignoreCase = true)) {
+                                  try {
+                                      val encoded = proxyAuthHeader.substring(6).trim()
+                                      val decoded = String(Base64.getDecoder().decode(encoded), Charsets.UTF_8)
+                                      val colonIdx = decoded.indexOf(':')
+                                      if (colonIdx >= 0) {
+                                          val pass = decoded.substring(colonIdx + 1)
+                                          if (pass == password) authenticated = true
+                                      }
+                                  } catch (e: Exception) {}
+                              }
+                              if (!authenticated) {
+                                  output.write("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"FlowNet\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                                  output.flush()
+                                  return
                               }
                           }
 
@@ -642,6 +704,7 @@ jobs:
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import java.net.Inet4Address
@@ -699,6 +762,7 @@ jobs:
           @Composable
           fun HttpProxyScreen(isRunning: Boolean, onRunningChange: (Boolean) -> Unit) {
               val context = LocalContext.current
+              var password by rememberSaveable { mutableStateOf("") }
               val localIp = remember { getLocalIpAddress() }
 
               Column(
@@ -732,8 +796,24 @@ jobs:
                           Text("Port: 8080",
                               color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
                               fontSize = 14.sp)
+                          if (password.isNotEmpty()) {
+                              Spacer(Modifier.height(8.dp))
+                              Text("🔐 محمي بكلمة مرور",
+                                  color = if (isRunning) Color.White else Color(0xFF38A169),
+                                  fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                          }
                       }
                   }
+
+                  OutlinedTextField(
+                      value = password,
+                      onValueChange = { password = it.take(30) },
+                      label = { Text("كلمة المرور (اتركها فارغة = بدون حماية)", fontSize = 12.sp) },
+                      visualTransformation = PasswordVisualTransformation(),
+                      modifier = Modifier.fillMaxWidth(),
+                      singleLine = true,
+                      enabled = !isRunning
+                  )
 
                   Button(
                       onClick = {
@@ -743,6 +823,7 @@ jobs:
                           } else {
                               val i = Intent(context, HttpProxyService::class.java).apply {
                                   putExtra("port", 8080)
+                                  putExtra("password", password)
                               }
                               if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                                   context.startForegroundService(i) else context.startService(i)
@@ -763,39 +844,37 @@ jobs:
                           colors = CardDefaults.cardColors(containerColor = Color.White)
                       ) {
                           Column(modifier = Modifier.padding(20.dp)) {
-                              Text("📱 كيف يستخدمه صديقك؟ (بدون أي تطبيق!)",
+                              Text("📱 كيف يستخدمه صديقك؟",
                                   fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
                               Spacer(Modifier.height(12.dp))
                               Text(
-                                  "1. يتصل صديقك بـ Hotspot جوالك\n\n" +
-                                  "2. يفتح إعدادات Wi-Fi على جهازه\n\n" +
-                                  "3. يضغط مطولاً على اسم الشبكة → تعديل\n\n" +
-                                  "4. في قسم Proxy يختار: Manual\n\n" +
-                                  "5. يدخل:\n" +
+                                  "1. يتصل بـ Hotspot جوالك\n\n" +
+                                  "2. إعدادات Wi-Fi → اضغط مطولاً على الشبكة → تعديل\n\n" +
+                                  "3. Proxy → Manual\n\n" +
+                                  "4. أدخل:\n" +
                                   "   • Hostname: $localIp\n" +
-                                  "   • Port: 8080\n\n" +
-                                  "6. يحفظ ✅\n\n" +
-                                  "7. الآن كل التطبيقات تعمل عبر بروكسي جوالك! 🎉",
+                                  "   • Port: 8080" +
+                                  (if (password.isNotEmpty()) "\n   • كلمة المرور: $password" else "") +
+                                  "\n\n5. يحفظ ✅ ويفتح المتصفح 🎉",
                                   fontSize = 12.sp, color = Color(0xFF64748B), lineHeight = 22.sp
                               )
                           }
                       }
 
-                      Card(
-                          modifier = Modifier.fillMaxWidth(),
-                          shape = RoundedCornerShape(12.dp),
-                          colors = CardDefaults.cardColors(containerColor = Color(0xFFE6FFFA))
-                      ) {
-                          Column(modifier = Modifier.padding(14.dp)) {
-                              Text("✅ الأفضل لـ", fontSize = 12.sp, fontWeight = FontWeight.Bold,
-                                  color = Color(0xFF2C7A7B))
-                              Text(
-                                  "• أندرويد / iPhone (إعدادات Wi-Fi مدمجة)\n" +
-                                  "• Chrome وجميع المتصفحات\n" +
-                                  "• معظم التطبيقات\n" +
-                                  "• Windows / Mac (بدون تطبيقات إضافية)",
-                                  fontSize = 11.sp, color = Color(0xFF234E52), lineHeight = 18.sp
-                              )
+                      if (password.isNotEmpty()) {
+                          Card(
+                              modifier = Modifier.fillMaxWidth(),
+                              shape = RoundedCornerShape(12.dp),
+                              colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF5E6))
+                          ) {
+                              Column(modifier = Modifier.padding(14.dp)) {
+                                  Text("🔐 كلمة المرور مطلوبة", fontSize = 12.sp,
+                                      fontWeight = FontWeight.Bold, color = Color(0xFFDD6B20))
+                                  Text(
+                                      "أي جهاز سيحتاج إدخال كلمة المرور للاتصال. احتفظ بها آمناً.",
+                                      fontSize = 11.sp, color = Color(0xFF92400E), lineHeight = 18.sp
+                                  )
+                              }
                           }
                       }
                   }
@@ -806,6 +885,7 @@ jobs:
           fun Socks5Screen(isRunning: Boolean, onRunningChange: (Boolean) -> Unit) {
               val context = LocalContext.current
               var port by rememberSaveable { mutableStateOf("1080") }
+              var password by rememberSaveable { mutableStateOf("") }
               val localIp = remember { getLocalIpAddress() }
 
               Column(
@@ -839,6 +919,12 @@ jobs:
                           Text("Port: $port",
                               color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
                               fontSize = 14.sp)
+                          if (password.isNotEmpty()) {
+                              Spacer(Modifier.height(8.dp))
+                              Text("🔐 محمي بكلمة مرور",
+                                  color = if (isRunning) Color.White else Color(0xFF38A169),
+                                  fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                          }
                       }
                   }
 
@@ -846,6 +932,16 @@ jobs:
                       value = port,
                       onValueChange = { port = it.filter { c -> c.isDigit() }.take(5) },
                       label = { Text("منفذ SOCKS5", fontSize = 12.sp) },
+                      modifier = Modifier.fillMaxWidth(),
+                      singleLine = true,
+                      enabled = !isRunning
+                  )
+
+                  OutlinedTextField(
+                      value = password,
+                      onValueChange = { password = it.take(30) },
+                      label = { Text("كلمة المرور (اتركها فارغة = بدون حماية)", fontSize = 12.sp) },
+                      visualTransformation = PasswordVisualTransformation(),
                       modifier = Modifier.fillMaxWidth(),
                       singleLine = true,
                       enabled = !isRunning
@@ -860,6 +956,7 @@ jobs:
                               val p = port.toIntOrNull() ?: 1080
                               val i = Intent(context, Socks5ProxyService::class.java).apply {
                                   putExtra("port", p)
+                                  putExtra("password", password)
                               }
                               if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                                   context.startForegroundService(i) else context.startService(i)
@@ -872,30 +969,6 @@ jobs:
                           containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169)
                       )
                   ) { Text(if (isRunning) "إيقاف" else "🚀 تشغيل SOCKS5", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
-
-                  if (isRunning) {
-                      Card(
-                          modifier = Modifier.fillMaxWidth(),
-                          shape = RoundedCornerShape(16.dp),
-                          colors = CardDefaults.cardColors(containerColor = Color.White)
-                      ) {
-                          Column(modifier = Modifier.padding(20.dp)) {
-                              Text("كيف يستخدمه صديقك؟", fontSize = 16.sp,
-                                  fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
-                              Spacer(Modifier.height(12.dp))
-                              Text(
-                                  "1. يتصل صديقك بـ Hotspot جوالك\n\n" +
-                                  "2. في Firefox على جهازه:\n" +
-                                  "   • الإعدادات → الشبكة → إعدادات الاتصال\n" +
-                                  "   • SOCKS Host: $localIp\n" +
-                                  "   • Port: $port\n" +
-                                  "   • SOCKS v5 ✓\n\n" +
-                                  "3. يفتح المتصفح ✅",
-                                  fontSize = 13.sp, color = Color(0xFF64748B), lineHeight = 22.sp
-                              )
-                          }
-                      }
-                  }
               }
           }
 
@@ -1037,5 +1110,5 @@ jobs:
         if: always()
         with:
           name: FlowNet-apk-${{ github.run_number }}
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: warn
