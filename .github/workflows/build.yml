@@ -250,7 +250,8 @@ jobs:
               val label: String,
               val ip: String,
               val emoji: String,
-              val isPermanent: Boolean = false
+              val isPermanent: Boolean = false,
+              val ifaceName: String = ""
           )
 
           fun getAllNetworkIps(): List<NetworkIp> {
@@ -261,6 +262,7 @@ jobs:
                   while (interfaces.hasMoreElements()) {
                       val iface = interfaces.nextElement()
                       if (!iface.isUp || iface.isLoopback) continue
+                      val ifaceName = iface.name
                       val addrs = iface.inetAddresses
                       while (addrs.hasMoreElements()) {
                           val addr = addrs.nextElement()
@@ -270,28 +272,105 @@ jobs:
                           seen.add(ip)
 
                           val info = when {
-                              ip.startsWith("192.168.49.") -> NetworkIp(
-                                  "WiFi Direct (أنت المضيف)", ip, "📡", isPermanent = true)
+                              ifaceName.startsWith("p2p") || ip.startsWith("192.168.49.") -> NetworkIp(
+                                  "WiFi Direct", ip, "📡", isPermanent = true, ifaceName = ifaceName)
                               ip.startsWith("192.168.43.") -> NetworkIp(
-                                  "Hotspot", ip, "🔥")
+                                  "Hotspot", ip, "🔥", ifaceName = ifaceName)
                               ip.startsWith("192.168.42.") -> NetworkIp(
-                                  "USB Tethering", ip, "🔌")
+                                  "USB Tethering", ip, "🔌", ifaceName = ifaceName)
                               ip.startsWith("192.168.44.") -> NetworkIp(
-                                  "Hotspot (بديل)", ip, "🔥")
-                              ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.") ->
-                                  NetworkIp("WiFi / LAN", ip, "📶")
-                              else -> continue
+                                  "Hotspot (بديل)", ip, "🔥", ifaceName = ifaceName)
+                              else -> NetworkIp("WiFi / LAN", ip, "📶", ifaceName = ifaceName)
                           }
                           result.add(info)
                       }
                   }
               } catch (e: Exception) {}
-              return result.sortedByDescending { it.isPermanent }
+              return result.sortedWith(compareByDescending<NetworkIp> { it.isPermanent }.thenBy { it.ip })
           }
 
           fun getLocalIpAddress(): String {
               val ips = getAllNetworkIps()
               return ips.firstOrNull()?.ip ?: "غير متاح"
+          }
+          EOF
+          
+          cat > app/src/main/java/com/flownet/app/WifiDirectManager.kt << 'EOF'
+          package com.flownet.app
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.net.wifi.p2p.WifiP2pManager
+          import android.os.Build
+          import androidx.core.content.ContextCompat
+
+          class WifiDirectManager(private val context: Context) {
+
+              private val manager: WifiP2pManager? =
+                  context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+
+              private var channel: WifiP2pManager.Channel? = null
+
+              fun hasPermission(): Boolean {
+                  return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      ContextCompat.checkSelfPermission(
+                          context, Manifest.permission.NEARBY_WIFI_DEVICES
+                      ) == PackageManager.PERMISSION_GRANTED
+                  } else {
+                      ContextCompat.checkSelfPermission(
+                          context, Manifest.permission.ACCESS_FINE_LOCATION
+                      ) == PackageManager.PERMISSION_GRANTED
+                  }
+              }
+
+              fun isSupported(): Boolean = manager != null
+
+              fun createGroup(onSuccess: () -> Unit, onFailure: (String) -> Unit) {
+                  val mgr = manager
+                  if (mgr == null) {
+                      onFailure("WiFi Direct غير مدعوم على هذا الجهاز")
+                      return
+                  }
+                  if (!hasPermission()) {
+                      onFailure("يحتاج إذن WiFi Direct")
+                      return
+                  }
+                  try {
+                      channel = mgr.initialize(context, context.mainLooper, null)
+                      mgr.createGroup(channel, object : WifiP2pManager.ActionListener {
+                          override fun onSuccess() {
+                              onSuccess()
+                          }
+                          override fun onFailure(reason: Int) {
+                              val msg = when (reason) {
+                                  WifiP2pManager.BUSY -> "WiFi Direct مشغول، أعد المحاولة"
+                                  WifiP2pManager.ERROR -> "خطأ في التشغيل"
+                                  WifiP2pManager.P2P_UNSUPPORTED -> "غير مدعوم"
+                                  else -> "فشل: كود $reason"
+                              }
+                              onFailure(msg)
+                          }
+                      })
+                  } catch (e: SecurityException) {
+                      onFailure("صلاحية مرفوضة")
+                  } catch (e: Exception) {
+                      onFailure(e.message ?: "خطأ غير معروف")
+                  }
+              }
+
+              fun removeGroup(onDone: () -> Unit = {}) {
+                  val mgr = manager ?: return
+                  val ch = channel ?: return
+                  try {
+                      mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                          override fun onSuccess() { onDone() }
+                          override fun onFailure(reason: Int) { onDone() }
+                      })
+                  } catch (e: Exception) {
+                      onDone()
+                  }
+              }
           }
           EOF
           
@@ -870,6 +949,7 @@ jobs:
           cat > app/src/main/java/com/flownet/app/MainActivity.kt << 'EOF'
           package com.flownet.app
 
+          import android.Manifest
           import android.content.Intent
           import android.net.Uri
           import android.os.Build
@@ -931,15 +1011,170 @@ jobs:
                           Tab(selected = tab == 2, onClick = { tab = 2 },
                               text = { Text("📁 ملفات", fontSize = 11.sp) })
                           Tab(selected = tab == 3, onClick = { tab = 3 },
+                              text = { Text("📶 واي فاي", fontSize = 11.sp) })
+                          Tab(selected = tab == 4, onClick = { tab = 4 },
                               text = { Text("📊 إحصائيات", fontSize = 11.sp) })
                       }
                       when (tab) {
                           0 -> HttpProxyScreen(httpRunning, networks, { networksRefresh++ }) { httpRunning = it }
                           1 -> Socks5Screen(socksRunning, networks, { networksRefresh++ }) { socksRunning = it }
                           2 -> FileSharingScreen(filesRunning, networks, { networksRefresh++ }) { filesRunning = it }
-                          3 -> StatsScreen()
+                          3 -> WifiDirectScreen(networks, { networksRefresh++ })
+                          4 -> StatsScreen()
                       }
                   }
+              }
+          }
+
+          @Composable
+          fun WifiDirectScreen(networks: List<NetworkIp>, onRefresh: () -> Unit) {
+              val context = LocalContext.current
+              val manager = remember { WifiDirectManager(context) }
+              var isRunning by rememberSaveable { mutableStateOf(false) }
+              var status by remember { mutableStateOf("") }
+              var errorMsg by remember { mutableStateOf<String?>(null) }
+
+              val permissionLauncher = rememberLauncherForActivityResult(
+                  contract = ActivityResultContracts.RequestPermission()
+              ) { granted ->
+                  if (granted) {
+                      manager.createGroup(
+                          onSuccess = {
+                              isRunning = true
+                              status = "WiFi Direct يعمل — IP: 192.168.49.1"
+                              errorMsg = null
+                              onRefresh()
+                          },
+                          onFailure = { err -> errorMsg = err }
+                      )
+                  } else {
+                      errorMsg = "تم رفض الإذن"
+                  }
+              }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .verticalScroll(rememberScrollState())
+                      .padding(20.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp)
+              ) {
+                  Text("WiFi Direct", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                  Text("IP ثابت دائماً 192.168.49.1", fontSize = 13.sp, color = Color(0xFF64748B))
+
+                  Card(
+                      modifier = Modifier.fillMaxWidth(),
+                      shape = RoundedCornerShape(16.dp),
+                      colors = CardDefaults.cardColors(
+                          containerColor = if (isRunning) Color(0xFF3182CE) else Color.White
+                      )
+                  ) {
+                      Column(modifier = Modifier.padding(20.dp)) {
+                          Text(
+                              if (isRunning) "WiFi Direct يعمل" else "WiFi Direct متوقف",
+                              color = if (isRunning) Color.White else Color(0xFF1E293B),
+                              fontSize = 20.sp, fontWeight = FontWeight.Bold
+                          )
+                          Spacer(Modifier.height(8.dp))
+                          Text(
+                              if (isRunning) "IP: 192.168.49.1 (ثابت)" else "اضغط لتشغيل الشبكة",
+                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
+                              fontSize = 13.sp
+                          )
+                      }
+                  }
+
+                  Button(
+                      onClick = {
+                          if (isRunning) {
+                              manager.removeGroup {
+                                  isRunning = false
+                                  status = ""
+                                  errorMsg = null
+                                  onRefresh()
+                              }
+                          } else {
+                              val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                                  Manifest.permission.NEARBY_WIFI_DEVICES
+                              else Manifest.permission.ACCESS_FINE_LOCATION
+
+                              if (manager.hasPermission()) {
+                                  manager.createGroup(
+                                      onSuccess = {
+                                          isRunning = true
+                                          status = "WiFi Direct يعمل — IP: 192.168.49.1"
+                                          errorMsg = null
+                                          onRefresh()
+                                      },
+                                      onFailure = { err -> errorMsg = err }
+                                  )
+                              } else {
+                                  permissionLauncher.launch(perm)
+                              }
+                          }
+                      },
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      shape = RoundedCornerShape(12.dp),
+                      colors = ButtonDefaults.buttonColors(
+                          containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169)
+                      )
+                  ) {
+                      Text(
+                          if (isRunning) "إيقاف WiFi Direct" else "🚀 تشغيل WiFi Direct",
+                          fontSize = 16.sp, fontWeight = FontWeight.Bold
+                      )
+                  }
+
+                  if (errorMsg != null) {
+                      Card(
+                          modifier = Modifier.fillMaxWidth(),
+                          shape = RoundedCornerShape(12.dp),
+                          colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE5E5))
+                      ) {
+                          Text(
+                              "⚠️ $errorMsg",
+                              modifier = Modifier.padding(14.dp),
+                              fontSize = 12.sp, color = Color(0xFF9B2C2C)
+                          )
+                      }
+                  }
+
+                  if (status.isNotEmpty()) {
+                      Card(
+                          modifier = Modifier.fillMaxWidth(),
+                          shape = RoundedCornerShape(12.dp),
+                          colors = CardDefaults.cardColors(containerColor = Color(0xFFE6FFFA))
+                      ) {
+                          Text(
+                              "✅ $status",
+                              modifier = Modifier.padding(14.dp),
+                              fontSize = 12.sp, color = Color(0xFF234E52),
+                              fontWeight = FontWeight.Bold
+                          )
+                      }
+                  }
+
+                  Card(
+                      modifier = Modifier.fillMaxWidth(),
+                      shape = RoundedCornerShape(16.dp),
+                      colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF5E6))
+                      ) {
+                      Column(modifier = Modifier.padding(16.dp)) {
+                          Text("📝 كيف يتصل صديقك؟",
+                              fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF92400E))
+                          Spacer(Modifier.height(8.dp))
+                          Text(
+                              "1. شغّل WiFi Direct هنا\n\n" +
+                              "2. صديقك: الإعدادات → Wi-Fi → Wi-Fi Direct\n\n" +
+                              "3. يرى اسمك → يقبل الدعوة\n\n" +
+                              "4. IP جوالك دائماً: 192.168.49.1\n\n" +
+                              "5. يستخدم هذا IP في البروكسي",
+                              fontSize = 12.sp, color = Color(0xFF92400E), lineHeight = 20.sp
+                          )
+                      }
+                  }
+
+                  NetworksCard(networks, onRefresh)
               }
           }
 
@@ -1248,21 +1483,6 @@ jobs:
                               )
                           }
                       }
-
-                      Card(
-                          modifier = Modifier.fillMaxWidth(),
-                          shape = RoundedCornerShape(12.dp),
-                          colors = CardDefaults.cardColors(containerColor = Color(0xFFE6FFFA))
-                      ) {
-                          Column(modifier = Modifier.padding(14.dp)) {
-                              Text("💡 لماذا WiFi Direct أفضل؟", fontSize = 12.sp,
-                                  fontWeight = FontWeight.Bold, color = Color(0xFF2C7A7B))
-                              Text(
-                                  "IP ثابت دائماً 192.168.49.1 — لا يتغير مهما كانت الشبكة.",
-                                  fontSize = 11.sp, color = Color(0xFF234E52), lineHeight = 18.sp
-                              )
-                          }
-                      }
                   }
               }
           }
@@ -1477,5 +1697,5 @@ jobs:
         if: always()
         with:
           name: FlowNet-apk-${{ github.run_number }}
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: warn
