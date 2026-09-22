@@ -101,6 +101,10 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -204,12 +208,7 @@ jobs:
                   _recentRequests.value = (listOf(log) + current).take(50)
               }
 
-              private fun recordDeviceActivity(
-                  ip: String,
-                  requests: Long = 0,
-                  recv: Long = 0,
-                  sent: Long = 0
-              ) {
+              private fun recordDeviceActivity(ip: String, requests: Long = 0, recv: Long = 0, sent: Long = 0) {
                   if (ip == "unknown" || ip.isEmpty()) return
                   val current = _devices.value
                   val existing = current[ip] ?: DeviceStats(ip = ip)
@@ -238,6 +237,61 @@ jobs:
                       else -> String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
                   }
               }
+          }
+          EOF
+          
+          cat > app/src/main/java/com/flownet/app/NetworkInfo.kt << 'EOF'
+          package com.flownet.app
+
+          import java.net.Inet4Address
+          import java.net.NetworkInterface
+
+          data class NetworkIp(
+              val label: String,
+              val ip: String,
+              val emoji: String,
+              val isPermanent: Boolean = false
+          )
+
+          fun getAllNetworkIps(): List<NetworkIp> {
+              val result = mutableListOf<NetworkIp>()
+              val seen = mutableSetOf<String>()
+              try {
+                  val interfaces = NetworkInterface.getNetworkInterfaces() ?: return result
+                  while (interfaces.hasMoreElements()) {
+                      val iface = interfaces.nextElement()
+                      if (!iface.isUp || iface.isLoopback) continue
+                      val addrs = iface.inetAddresses
+                      while (addrs.hasMoreElements()) {
+                          val addr = addrs.nextElement()
+                          if (addr.isLoopbackAddress || addr !is Inet4Address) continue
+                          val ip = addr.hostAddress ?: continue
+                          if (ip in seen) continue
+                          seen.add(ip)
+
+                          val info = when {
+                              ip.startsWith("192.168.49.") -> NetworkIp(
+                                  "WiFi Direct (أنت المضيف)", ip, "📡", isPermanent = true)
+                              ip.startsWith("192.168.43.") -> NetworkIp(
+                                  "Hotspot", ip, "🔥")
+                              ip.startsWith("192.168.42.") -> NetworkIp(
+                                  "USB Tethering", ip, "🔌")
+                              ip.startsWith("192.168.44.") -> NetworkIp(
+                                  "Hotspot (بديل)", ip, "🔥")
+                              ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.") ->
+                                  NetworkIp("WiFi / LAN", ip, "📶")
+                              else -> continue
+                          }
+                          result.add(info)
+                      }
+                  }
+              } catch (e: Exception) {}
+              return result.sortedByDescending { it.isPermanent }
+          }
+
+          fun getLocalIpAddress(): String {
+              val ips = getAllNetworkIps()
+              return ips.firstOrNull()?.ip ?: "غير متاح"
           }
           EOF
           
@@ -816,7 +870,9 @@ jobs:
           cat > app/src/main/java/com/flownet/app/MainActivity.kt << 'EOF'
           package com.flownet.app
 
+          import android.Manifest
           import android.content.Intent
+          import android.content.pm.PackageManager
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
@@ -825,6 +881,7 @@ jobs:
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.compose.setContent
           import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.RoundedCornerShape
@@ -840,8 +897,7 @@ jobs:
           import androidx.compose.ui.text.input.PasswordVisualTransformation
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
-          import java.net.Inet4Address
-          import java.net.NetworkInterface
+          import androidx.core.content.ContextCompat
           import java.text.SimpleDateFormat
           import java.util.Date
           import java.util.Locale
@@ -863,27 +919,82 @@ jobs:
               var httpRunning by rememberSaveable { mutableStateOf(false) }
               var socksRunning by rememberSaveable { mutableStateOf(false) }
               var filesRunning by rememberSaveable { mutableStateOf(false) }
+              var networksRefresh by remember { mutableStateOf(0) }
+              val networks = remember(networksRefresh) { getAllNetworkIps() }
 
               Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFFF4F7FC)) {
                   Column(modifier = Modifier.fillMaxSize()) {
                       TabRow(
-                          selectedTabIndex = tab,
+                          selectedIndex = tab,
                           containerColor = Color.White
                       ) {
                           Tab(selected = tab == 0, onClick = { tab = 0 },
-                              text = { Text("🌐 HTTP", fontSize = 12.sp) })
+                              text = { Text("🌐 HTTP", fontSize = 11.sp) })
                           Tab(selected = tab == 1, onClick = { tab = 1 },
-                              text = { Text("🔒 SOCKS", fontSize = 12.sp) })
+                              text = { Text("🔒 SOCKS", fontSize = 11.sp) })
                           Tab(selected = tab == 2, onClick = { tab = 2 },
-                              text = { Text("📁 ملفات", fontSize = 12.sp) })
+                              text = { Text("📁 ملفات", fontSize = 11.sp) })
                           Tab(selected = tab == 3, onClick = { tab = 3 },
-                              text = { Text("📊 إحصائيات", fontSize = 12.sp) })
+                              text = { Text("📊 إحصائيات", fontSize = 11.sp) })
                       }
                       when (tab) {
-                          0 -> HttpProxyScreen(httpRunning) { httpRunning = it }
-                          1 -> Socks5Screen(socksRunning) { socksRunning = it }
-                          2 -> FileSharingScreen(filesRunning) { filesRunning = it }
+                          0 -> HttpProxyScreen(httpRunning, networks, { networksRefresh++ }) { httpRunning = it }
+                          1 -> Socks5Screen(socksRunning, networks, { networksRefresh++ }) { socksRunning = it }
+                          2 -> FileSharingScreen(filesRunning, networks, { networksRefresh++ }) { filesRunning = it }
                           3 -> StatsScreen()
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun NetworksCard(networks: List<NetworkIp>, onRefresh: () -> Unit) {
+              Card(
+                  modifier = Modifier.fillMaxWidth(),
+                  shape = RoundedCornerShape(16.dp),
+                  colors = CardDefaults.cardColors(containerColor = Color(0xFFF0F9FF))
+              ) {
+                  Column(modifier = Modifier.padding(16.dp)) {
+                      Row(
+                          modifier = Modifier.fillMaxWidth(),
+                          horizontalArrangement = Arrangement.SpaceBetween,
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Text("📡 شبكاتك المتاحة",
+                              fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                          TextButton(onClick = onRefresh) {
+                              Text("🔄 تحديث", fontSize = 11.sp, color = Color(0xFF3182CE))
+                          }
+                      }
+                      Spacer(Modifier.height(8.dp))
+
+                      if (networks.isEmpty()) {
+                          Text("لا توجد شبكات نشطة", fontSize = 12.sp, color = Color(0xFF94A3B8))
+                      } else {
+                          networks.forEach { net ->
+                              Row(
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .padding(vertical = 6.dp),
+                                  horizontalArrangement = Arrangement.SpaceBetween,
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Text(net.emoji, fontSize = 16.sp)
+                                      Spacer(Modifier.width(8.dp))
+                                      Text(net.label, fontSize = 12.sp, color = Color(0xFF64748B))
+                                  }
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Text(net.ip, fontSize = 13.sp,
+                                          fontWeight = FontWeight.Bold,
+                                          color = if (net.isPermanent) Color(0xFF38A169) else Color(0xFF1E293B))
+                                      if (net.isPermanent) {
+                                          Spacer(Modifier.width(4.dp))
+                                          Text("✔️", fontSize = 12.sp)
+                                      }
+                                  }
+                              }
+                          }
                       }
                   }
               }
@@ -915,7 +1026,7 @@ jobs:
                       horizontalArrangement = Arrangement.SpaceBetween,
                       verticalAlignment = Alignment.CenterVertically
                   ) {
-                      Text("📊 الإحصائيات المباشرة", fontSize = 20.sp,
+                      Text("📊 الإحصائيات", fontSize = 20.sp,
                           fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
                       TextButton(onClick = { ProxyStats.reset() }) {
                           Text("مسح", color = Color(0xFFE53E3E), fontSize = 12.sp)
@@ -926,53 +1037,21 @@ jobs:
                       modifier = Modifier.fillMaxWidth(),
                       horizontalArrangement = Arrangement.spacedBy(10.dp)
                   ) {
-                      StatCard(
-                          title = "أجهزة فريدة",
-                          value = devicesList.size.toString(),
-                          icon = "📱",
-                          color = Color(0xFF3182CE),
-                          modifier = Modifier.weight(1f)
-                      )
-                      StatCard(
-                          title = "اتصالات نشطة",
-                          value = activeConnections.toString(),
-                          icon = "🔗",
-                          color = Color(0xFF805AD5),
-                          modifier = Modifier.weight(1f)
-                      )
+                      StatCard("أجهزة فريدة", devicesList.size.toString(), "📱", Color(0xFF3182CE), Modifier.weight(1f))
+                      StatCard("اتصالات", activeConnections.toString(), "🔗", Color(0xFF805AD5), Modifier.weight(1f))
                   }
-
                   Row(
                       modifier = Modifier.fillMaxWidth(),
                       horizontalArrangement = Arrangement.spacedBy(10.dp)
                   ) {
-                      StatCard(
-                          title = "إجمالي الطلبات",
-                          value = totalRequests.toString(),
-                          icon = "🔢",
-                          color = Color(0xFF805AD5),
-                          modifier = Modifier.weight(1f)
-                      )
-                      StatCard(
-                          title = "التنزيل",
-                          value = ProxyStats.formatBytes(bytesReceived),
-                          icon = "📥",
-                          color = Color(0xFF38A169),
-                          modifier = Modifier.weight(1f)
-                      )
+                      StatCard("طلبات", totalRequests.toString(), "🔢", Color(0xFF805AD5), Modifier.weight(1f))
+                      StatCard("تنزيل", ProxyStats.formatBytes(bytesReceived), "📥", Color(0xFF38A169), Modifier.weight(1f))
                   }
-
                   Row(
                       modifier = Modifier.fillMaxWidth(),
                       horizontalArrangement = Arrangement.spacedBy(10.dp)
                   ) {
-                      StatCard(
-                          title = "الرفع",
-                          value = ProxyStats.formatBytes(bytesSent),
-                          icon = "📤",
-                          color = Color(0xFFED8936),
-                          modifier = Modifier.weight(1f)
-                      )
+                      StatCard("رفع", ProxyStats.formatBytes(bytesSent), "📤", Color(0xFFED8936), Modifier.weight(1f))
                       Spacer(modifier = Modifier.weight(1f))
                   }
 
@@ -982,60 +1061,31 @@ jobs:
                       colors = CardDefaults.cardColors(containerColor = Color.White)
                   ) {
                       Column(modifier = Modifier.padding(16.dp)) {
-                          Text("📱 الأجهزة المتصلة (${devicesList.size})",
+                          Text("📱 الأجهزة (${devicesList.size})",
                               fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
                           Spacer(Modifier.height(10.dp))
 
                           if (devicesList.isEmpty()) {
-                              Text(
-                                  "لا توجد أجهزة بعد. شغّل بروكسي وابدأ التصفح.",
-                                  fontSize = 12.sp, color = Color(0xFF94A3B8),
-                                  modifier = Modifier.padding(vertical = 20.dp)
-                              )
+                              Text("لا توجد أجهزة بعد.", fontSize = 12.sp, color = Color(0xFF94A3B8),
+                                  modifier = Modifier.padding(vertical = 20.dp))
                           } else {
                               devicesList.forEach { device ->
-                                  Column(
-                                      modifier = Modifier
-                                          .fillMaxWidth()
-                                          .padding(vertical = 8.dp)
-                                  ) {
+                                  Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                                       Row(
                                           modifier = Modifier.fillMaxWidth(),
                                           horizontalArrangement = Arrangement.SpaceBetween,
                                           verticalAlignment = Alignment.CenterVertically
                                       ) {
-                                          Text(
-                                              "📱 ${device.ip}",
-                                              fontSize = 13.sp,
-                                              fontWeight = FontWeight.Bold,
-                                              color = Color(0xFF1E293B)
-                                          )
-                                          Text(
-                                              timeFormat.format(Date(device.lastSeen)),
-                                              fontSize = 10.sp,
-                                              color = Color(0xFF94A3B8)
-                                          )
+                                          Text("📱 ${device.ip}", fontSize = 13.sp,
+                                              fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                                          Text(timeFormat.format(Date(device.lastSeen)),
+                                              fontSize = 10.sp, color = Color(0xFF94A3B8))
                                       }
                                       Spacer(Modifier.height(4.dp))
-                                      Row(
-                                          modifier = Modifier.fillMaxWidth(),
-                                          horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                      ) {
-                                          Text(
-                                              "🔢 ${device.requestCount}",
-                                              fontSize = 10.sp,
-                                              color = Color(0xFF64748B)
-                                          )
-                                          Text(
-                                              "📥 ${ProxyStats.formatBytes(device.bytesReceived)}",
-                                              fontSize = 10.sp,
-                                              color = Color(0xFF38A169)
-                                          )
-                                          Text(
-                                              "📤 ${ProxyStats.formatBytes(device.bytesSent)}",
-                                              fontSize = 10.sp,
-                                              color = Color(0xFFED8936)
-                                          )
+                                      Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                          Text("🔢 ${device.requestCount}", fontSize = 10.sp, color = Color(0xFF64748B))
+                                          Text("📥 ${ProxyStats.formatBytes(device.bytesReceived)}", fontSize = 10.sp, color = Color(0xFF38A169))
+                                          Text("📤 ${ProxyStats.formatBytes(device.bytesSent)}", fontSize = 10.sp, color = Color(0xFFED8936))
                                       }
                                   }
                                   HorizontalDivider(color = Color(0xFFE2E8F0), thickness = 0.5.dp)
@@ -1050,52 +1100,36 @@ jobs:
                       colors = CardDefaults.cardColors(containerColor = Color.White)
                   ) {
                       Column(modifier = Modifier.padding(16.dp)) {
-                          Text("📝 آخر الطلبات",
-                              fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                          Text("📝 آخر الطلبات", fontSize = 14.sp,
+                              fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
                           Spacer(Modifier.height(8.dp))
 
                           if (recentRequests.isEmpty()) {
-                              Text(
-                                  "لا توجد طلبات بعد.",
-                                  fontSize = 12.sp, color = Color(0xFF94A3B8),
-                                  modifier = Modifier.padding(vertical = 20.dp)
-                              )
+                              Text("لا توجد طلبات بعد.", fontSize = 12.sp, color = Color(0xFF94A3B8),
+                                  modifier = Modifier.padding(vertical = 20.dp))
                           } else {
                               recentRequests.take(20).forEach { req ->
                                   Row(
-                                      modifier = Modifier
-                                          .fillMaxWidth()
-                                          .padding(vertical = 6.dp),
+                                      modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
                                       horizontalArrangement = Arrangement.SpaceBetween,
                                       verticalAlignment = Alignment.CenterVertically
                                   ) {
                                       Column(modifier = Modifier.weight(1f)) {
-                                          Text(
-                                              text = "${req.method} ${req.host}",
-                                              fontSize = 11.sp, color = Color(0xFF1E293B),
-                                              fontWeight = FontWeight.Bold
-                                          )
-                                          Text(
-                                              text = req.path.take(45),
-                                              fontSize = 10.sp, color = Color(0xFF64748B)
-                                          )
+                                          Text("${req.method} ${req.host}", fontSize = 11.sp,
+                                              color = Color(0xFF1E293B), fontWeight = FontWeight.Bold)
+                                          Text(req.path.take(40), fontSize = 10.sp, color = Color(0xFF64748B))
                                       }
                                       Column(horizontalAlignment = Alignment.End) {
-                                          Text(
-                                              text = req.type,
-                                              fontSize = 9.sp,
+                                          Text(req.type, fontSize = 9.sp,
                                               color = when (req.type) {
                                                   "HTTP" -> Color(0xFF3182CE)
                                                   "SOCKS5" -> Color(0xFF805AD5)
                                                   "FILES" -> Color(0xFF38A169)
                                                   else -> Color(0xFF64748B)
                                               },
-                                              fontWeight = FontWeight.Bold
-                                          )
-                                          Text(
-                                              text = timeFormat.format(Date(req.timestamp)),
-                                              fontSize = 9.sp, color = Color(0xFF94A3B8)
-                                          )
+                                              fontWeight = FontWeight.Bold)
+                                          Text(timeFormat.format(Date(req.timestamp)),
+                                              fontSize = 9.sp, color = Color(0xFF94A3B8))
                                       }
                                   }
                                   HorizontalDivider(color = Color(0xFFE2E8F0), thickness = 0.5.dp)
@@ -1107,13 +1141,7 @@ jobs:
           }
 
           @Composable
-          fun StatCard(
-              title: String,
-              value: String,
-              icon: String,
-              color: Color,
-              modifier: Modifier = Modifier
-          ) {
+          fun StatCard(title: String, value: String, icon: String, color: Color, modifier: Modifier = Modifier) {
               Card(
                   modifier = modifier,
                   shape = RoundedCornerShape(14.dp),
@@ -1130,10 +1158,14 @@ jobs:
           }
 
           @Composable
-          fun HttpProxyScreen(isRunning: Boolean, onRunningChange: (Boolean) -> Unit) {
+          fun HttpProxyScreen(
+              isRunning: Boolean,
+              networks: List<NetworkIp>,
+              onRefresh: () -> Unit,
+              onRunningChange: (Boolean) -> Unit
+          ) {
               val context = LocalContext.current
               var password by rememberSaveable { mutableStateOf("") }
-              val localIp = remember { getLocalIpAddress() }
 
               Column(
                   modifier = Modifier
@@ -1159,15 +1191,13 @@ jobs:
                               fontSize = 20.sp, fontWeight = FontWeight.Bold
                           )
                           Spacer(Modifier.height(12.dp))
-                          Text("IP: $localIp",
-                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
-                              fontSize = 14.sp)
-                          Spacer(Modifier.height(4.dp))
                           Text("Port: 8080",
                               color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
                               fontSize = 14.sp)
                       }
                   }
+
+                  NetworksCard(networks, onRefresh)
 
                   OutlinedTextField(
                       value = password,
@@ -1201,7 +1231,7 @@ jobs:
                       )
                   ) { Text(if (isRunning) "إيقاف" else "🚀 تشغيل HTTP Proxy", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
 
-                  if (isRunning) {
+                  if (isRunning && networks.isNotEmpty()) {
                       Card(
                           modifier = Modifier.fillMaxWidth(),
                           shape = RoundedCornerShape(16.dp),
@@ -1212,15 +1242,28 @@ jobs:
                                   fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
                               Spacer(Modifier.height(12.dp))
                               Text(
-                                  "1. يتصل بـ Hotspot جوالك\n\n" +
-                                  "2. إعدادات Wi-Fi → اضغط مطولاً على الشبكة → تعديل\n\n" +
-                                  "3. Proxy → Manual\n\n" +
-                                  "4. أدخل:\n" +
-                                  "   • Hostname: $localIp\n" +
-                                  "   • Port: 8080" +
-                                  (if (password.isNotEmpty()) "\n   • كلمة المرور: $password" else "") +
-                                  "\n\n5. يحفظ ✅ ويفتح المتصفح 🎉",
+                                  "1. يتصل بـ WiFi Direct أو Hotspot\n\n" +
+                                  "2. إعدادات Wi-Fi → Proxy → Manual\n\n" +
+                                  "3. استخدم IP المناسب:\n" +
+                                  networks.joinToString("\n") { "   ${it.emoji} ${it.ip} (${it.label})" } +
+                                  "\n\n4. Port: 8080" +
+                                  (if (password.isNotEmpty()) "\n5. كلمة المرور: $password" else ""),
                                   fontSize = 12.sp, color = Color(0xFF64748B), lineHeight = 22.sp
+                              )
+                          }
+                      }
+
+                      Card(
+                          modifier = Modifier.fillMaxWidth(),
+                          shape = RoundedCornerShape(12.dp),
+                          colors = CardDefaults.cardColors(containerColor = Color(0xFFE6FFFA))
+                      ) {
+                          Column(modifier = Modifier.padding(14.dp)) {
+                              Text("💡 لماذا WiFi Direct أفضل؟", fontSize = 12.sp,
+                                  fontWeight = FontWeight.Bold, color = Color(0xFF2C7A7B))
+                              Text(
+                                  "IP ثابت دائماً 192.168.49.1 — لا يتغير مهما كانت الشبكة.",
+                                  fontSize = 11.sp, color = Color(0xFF234E52), lineHeight = 18.sp
                               )
                           }
                       }
@@ -1229,11 +1272,15 @@ jobs:
           }
 
           @Composable
-          fun Socks5Screen(isRunning: Boolean, onRunningChange: (Boolean) -> Unit) {
+          fun Socks5Screen(
+              isRunning: Boolean,
+              networks: List<NetworkIp>,
+              onRefresh: () -> Unit,
+              onRunningChange: (Boolean) -> Unit
+          ) {
               val context = LocalContext.current
               var port by rememberSaveable { mutableStateOf("1080") }
               var password by rememberSaveable { mutableStateOf("") }
-              val localIp = remember { getLocalIpAddress() }
 
               Column(
                   modifier = Modifier
@@ -1259,15 +1306,13 @@ jobs:
                               fontSize = 20.sp, fontWeight = FontWeight.Bold
                           )
                           Spacer(Modifier.height(12.dp))
-                          Text("IP: $localIp",
-                              color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
-                              fontSize = 14.sp)
-                          Spacer(Modifier.height(4.dp))
                           Text("Port: $port",
                               color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
                               fontSize = 14.sp)
                       }
                   }
+
+                  NetworksCard(networks, onRefresh)
 
                   OutlinedTextField(
                       value = port,
@@ -1314,10 +1359,14 @@ jobs:
           }
 
           @Composable
-          fun FileSharingScreen(isRunning: Boolean, onRunningChange: (Boolean) -> Unit) {
+          fun FileSharingScreen(
+              isRunning: Boolean,
+              networks: List<NetworkIp>,
+              onRefresh: () -> Unit,
+              onRunningChange: (Boolean) -> Unit
+          ) {
               val context = LocalContext.current
               var selectedFiles by remember { mutableStateOf<List<Uri>>(emptyList()) }
-              val localIp = remember { getLocalIpAddress() }
 
               val filePicker = rememberLauncherForActivityResult(
                   contract = ActivityResultContracts.OpenMultipleDocuments()
@@ -1346,13 +1395,13 @@ jobs:
                               fontSize = 18.sp, fontWeight = FontWeight.Bold
                           )
                           Spacer(Modifier.height(8.dp))
-                          Text(
-                              "http://$localIp:8081",
+                          Text("Port: 8081",
                               color = if (isRunning) Color.White.copy(alpha = 0.9f) else Color(0xFF64748B),
-                              fontSize = 13.sp
-                          )
+                              fontSize = 13.sp)
                       }
                   }
+
+                  NetworksCard(networks, onRefresh)
 
                   Button(
                       onClick = { filePicker.launch(arrayOf("*/*")) },
@@ -1401,7 +1450,7 @@ jobs:
                           containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169),
                           disabledContainerColor = Color(0xFFCBD5E0)
                       )
-                  ) { Text(if (isRunning) "إيقاف الخدمة" else "🚀 تشغيل", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+                  ) { Text(if (isRunning) "إيقاف" else "🚀 تشغيل", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
               }
           }
 
@@ -1416,25 +1465,6 @@ jobs:
                   }
               } catch (e: Exception) {}
               return name
-          }
-
-          fun getLocalIpAddress(): String {
-              try {
-                  val interfaces = NetworkInterface.getNetworkInterfaces() ?: return "غير متاح"
-                  while (interfaces.hasMoreElements()) {
-                      val iface = interfaces.nextElement()
-                      if (!iface.isUp || iface.isLoopback) continue
-                      val addrs = iface.inetAddresses
-                      while (addrs.hasMoreElements()) {
-                          val a = addrs.nextElement()
-                          if (!a.isLoopbackAddress && a is Inet4Address) {
-                              val ip = a.hostAddress ?: continue
-                              if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) return ip
-                          }
-                      }
-                  }
-              } catch (e: Exception) {}
-              return "غير متاح"
           }
           EOF
           
