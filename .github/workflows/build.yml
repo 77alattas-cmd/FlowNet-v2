@@ -149,6 +149,14 @@ jobs:
               val size: Long = 0
           )
 
+          data class DeviceStats(
+              val ip: String,
+              val requestCount: Long = 0,
+              val bytesReceived: Long = 0,
+              val bytesSent: Long = 0,
+              val lastSeen: Long = System.currentTimeMillis()
+          )
+
           object ProxyStats {
               private val _activeConnections = MutableStateFlow(0)
               val activeConnections: StateFlow<Int> = _activeConnections.asStateFlow()
@@ -165,6 +173,9 @@ jobs:
               private val _recentRequests = MutableStateFlow<List<RequestLog>>(emptyList())
               val recentRequests: StateFlow<List<RequestLog>> = _recentRequests.asStateFlow()
 
+              private val _devices = MutableStateFlow<Map<String, DeviceStats>>(emptyMap())
+              val devices: StateFlow<Map<String, DeviceStats>> = _devices.asStateFlow()
+
               fun connectionOpened() {
                   _activeConnections.value = _activeConnections.value + 1
               }
@@ -175,19 +186,40 @@ jobs:
                   }
               }
 
-              fun addBytesReceived(n: Long) {
+              fun addBytesReceived(n: Long, clientIp: String = "unknown") {
                   _bytesReceived.value = _bytesReceived.value + n
+                  recordDeviceActivity(clientIp, recv = n)
               }
 
-              fun addBytesSent(n: Long) {
+              fun addBytesSent(n: Long, clientIp: String = "unknown") {
                   _bytesSent.value = _bytesSent.value + n
+                  recordDeviceActivity(clientIp, sent = n)
               }
 
-              fun logRequest(method: String, host: String, path: String, type: String, size: Long = 0) {
+              fun logRequest(method: String, host: String, path: String, type: String, size: Long = 0, clientIp: String = "unknown") {
                   _totalRequests.value = _totalRequests.value + 1
+                  recordDeviceActivity(clientIp, requests = 1)
                   val log = RequestLog(System.currentTimeMillis(), method, host, path, type, size)
                   val current = _recentRequests.value
                   _recentRequests.value = (listOf(log) + current).take(50)
+              }
+
+              private fun recordDeviceActivity(
+                  ip: String,
+                  requests: Long = 0,
+                  recv: Long = 0,
+                  sent: Long = 0
+              ) {
+                  if (ip == "unknown" || ip.isEmpty()) return
+                  val current = _devices.value
+                  val existing = current[ip] ?: DeviceStats(ip = ip)
+                  val updated = existing.copy(
+                      requestCount = existing.requestCount + requests,
+                      bytesReceived = existing.bytesReceived + recv,
+                      bytesSent = existing.bytesSent + sent,
+                      lastSeen = System.currentTimeMillis()
+                  )
+                  _devices.value = current + (ip to updated)
               }
 
               fun reset() {
@@ -195,6 +227,7 @@ jobs:
                   _bytesSent.value = 0
                   _totalRequests.value = 0
                   _recentRequests.value = emptyList()
+                  _devices.value = emptyMap()
               }
 
               fun formatBytes(bytes: Long): String {
@@ -222,6 +255,7 @@ jobs:
           import android.provider.OpenableColumns
           import androidx.core.app.NotificationCompat
           import java.io.OutputStream
+          import java.net.InetSocketAddress
           import java.net.ServerSocket
           import java.net.Socket
 
@@ -258,6 +292,7 @@ jobs:
               }
 
               private fun handleClient(socket: Socket) {
+                  val clientIp = getClientIp(socket)
                   socket.use { sock ->
                       try {
                           val reader = sock.getInputStream().bufferedReader()
@@ -278,7 +313,7 @@ jobs:
                               path.startsWith("/file/") -> {
                                   val index = path.removePrefix("/file/").toIntOrNull()
                                   if (index != null && index in files.indices) {
-                                      serveFile(output, files[index])
+                                      serveFile(output, files[index], clientIp)
                                   } else {
                                       sendNotFound(output)
                                   }
@@ -292,7 +327,7 @@ jobs:
                   }
               }
 
-              private fun serveFile(output: OutputStream, uri: Uri) {
+              private fun serveFile(output: OutputStream, uri: Uri, clientIp: String) {
                   try {
                       val inputStream = contentResolver.openInputStream(uri)
                       if (inputStream == null) { sendNotFound(output); return }
@@ -302,8 +337,8 @@ jobs:
                       val header = "HTTP/1.1 200 OK\r\nContent-Type: $mimeType\r\nContent-Length: ${bytes.size}\r\nContent-Disposition: attachment; filename=\"$fileName\"\r\nConnection: close\r\n\r\n"
                       output.write(header.toByteArray())
                       output.write(bytes)
-                      ProxyStats.addBytesSent(bytes.size.toLong())
-                      ProxyStats.logRequest("GET", "fileserver", "/file/$fileName", "FILES", bytes.size.toLong())
+                      ProxyStats.addBytesSent(bytes.size.toLong(), clientIp)
+                      ProxyStats.logRequest("GET", "fileserver", "/file/$fileName", "FILES", bytes.size.toLong(), clientIp)
                   } catch (e: Exception) { e.printStackTrace() }
               }
 
@@ -358,6 +393,12 @@ jobs:
 
               companion object {
                   private const val NOTIFICATION_ID = 1001
+
+                  fun getClientIp(socket: Socket): String {
+                      return try {
+                          (socket.remoteSocketAddress as? InetSocketAddress)?.address?.hostAddress ?: "unknown"
+                      } catch (e: Exception) { "unknown" }
+                  }
               }
           }
           EOF
@@ -413,6 +454,7 @@ jobs:
               }
 
               private fun handleClient(client: Socket) {
+                  val clientIp = FileServerService.getClientIp(client)
                   ProxyStats.connectionOpened()
                   try {
                       client.use { sock ->
@@ -487,7 +529,7 @@ jobs:
                           }
                           val targetPort = (input.read() shl 8) or input.read()
 
-                          ProxyStats.logRequest("CONNECT", host, ":$targetPort", "SOCKS5")
+                          ProxyStats.logRequest("CONNECT", host, ":$targetPort", "SOCKS5", 0, clientIp)
 
                           var target: Socket? = null
                           try {
@@ -496,8 +538,8 @@ jobs:
                               output.write(byteArrayOf(0x05.toByte(), 0x00.toByte(), 0x00.toByte(), 0x01.toByte(), 0, 0, 0, 0, 0, 0))
                               output.flush()
 
-                              val t1 = Thread { relay(sock.getInputStream(), target.getOutputStream(), true) }
-                              val t2 = Thread { relay(target.getInputStream(), sock.getOutputStream(), false) }
+                              val t1 = Thread { relay(sock.getInputStream(), target.getOutputStream(), true, clientIp) }
+                              val t2 = Thread { relay(target.getInputStream(), sock.getOutputStream(), false, clientIp) }
                               t1.start(); t2.start()
                               t1.join(); t2.join()
                           } catch (e: Exception) {
@@ -516,7 +558,7 @@ jobs:
                   }
               }
 
-              private fun relay(input: InputStream, output: OutputStream, upload: Boolean) {
+              private fun relay(input: InputStream, output: OutputStream, upload: Boolean, clientIp: String) {
                   try {
                       val buf = ByteArray(8192)
                       while (!Thread.currentThread().isInterrupted) {
@@ -524,8 +566,8 @@ jobs:
                           if (n <= 0) break
                           output.write(buf, 0, n)
                           output.flush()
-                          if (upload) ProxyStats.addBytesSent(n.toLong())
-                          else ProxyStats.addBytesReceived(n.toLong())
+                          if (upload) ProxyStats.addBytesSent(n.toLong(), clientIp)
+                          else ProxyStats.addBytesReceived(n.toLong(), clientIp)
                       }
                   } catch (e: Exception) {}
               }
@@ -615,6 +657,7 @@ jobs:
               }
 
               private fun handleClient(client: Socket) {
+                  val clientIp = FileServerService.getClientIp(client)
                   ProxyStats.connectionOpened()
                   try {
                       client.use { sock ->
@@ -672,15 +715,15 @@ jobs:
                               val host = hostPort[0]
                               val targetPort = hostPort.getOrNull(1)?.toIntOrNull() ?: 443
 
-                              ProxyStats.logRequest("CONNECT", host, ":$targetPort", "HTTP")
+                              ProxyStats.logRequest("CONNECT", host, ":$targetPort", "HTTP", 0, clientIp)
 
                               val target = Socket()
                               target.connect(InetSocketAddress(host, targetPort), 15000)
                               output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
                               output.flush()
 
-                              val t1 = Thread { relay(sock.getInputStream(), target.getOutputStream(), true) }
-                              val t2 = Thread { relay(target.getInputStream(), sock.getOutputStream(), false) }
+                              val t1 = Thread { relay(sock.getInputStream(), target.getOutputStream(), true, clientIp) }
+                              val t2 = Thread { relay(target.getInputStream(), sock.getOutputStream(), false, clientIp) }
                               t1.start(); t2.start()
                               t1.join(); t2.join()
 
@@ -691,7 +734,7 @@ jobs:
                               val targetPort = if (uri.port > 0) uri.port else 80
                               val path = (uri.rawPath ?: "/") + (uri.rawQuery?.let { "?$it" } ?: "")
 
-                              ProxyStats.logRequest(method, host, path, "HTTP")
+                              ProxyStats.logRequest(method, host, path, "HTTP", 0, clientIp)
 
                               val target = Socket()
                               target.connect(InetSocketAddress(host, targetPort), 15000)
@@ -713,7 +756,7 @@ jobs:
                               targetOut.write(requestBuilder.toString().toByteArray())
                               targetOut.flush()
 
-                              relay(target.getInputStream(), output, false)
+                              relay(target.getInputStream(), output, false, clientIp)
 
                               try { target.close() } catch (e: Exception) {}
                           }
@@ -725,7 +768,7 @@ jobs:
                   }
               }
 
-              private fun relay(input: InputStream, output: OutputStream, upload: Boolean) {
+              private fun relay(input: InputStream, output: OutputStream, upload: Boolean, clientIp: String) {
                   try {
                       val buf = ByteArray(8192)
                       while (!Thread.currentThread().isInterrupted) {
@@ -733,8 +776,8 @@ jobs:
                           if (n <= 0) break
                           output.write(buf, 0, n)
                           output.flush()
-                          if (upload) ProxyStats.addBytesSent(n.toLong())
-                          else ProxyStats.addBytesReceived(n.toLong())
+                          if (upload) ProxyStats.addBytesSent(n.toLong(), clientIp)
+                          else ProxyStats.addBytesReceived(n.toLong(), clientIp)
                       }
                   } catch (e: Exception) {}
               }
@@ -782,7 +825,6 @@ jobs:
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.compose.setContent
           import androidx.activity.result.contract.ActivityResultContracts
-          import androidx.compose.foundation.background
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.RoundedCornerShape
@@ -854,7 +896,12 @@ jobs:
               val bytesSent by ProxyStats.bytesSent.collectAsState()
               val totalRequests by ProxyStats.totalRequests.collectAsState()
               val recentRequests by ProxyStats.recentRequests.collectAsState()
+              val devicesMap by ProxyStats.devices.collectAsState()
               val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+
+              val devicesList = remember(devicesMap) {
+                  devicesMap.values.sortedByDescending { it.lastSeen }
+              }
 
               Column(
                   modifier = Modifier
@@ -880,16 +927,16 @@ jobs:
                       horizontalArrangement = Arrangement.spacedBy(10.dp)
                   ) {
                       StatCard(
-                          title = "الأجهزة المتصلة",
-                          value = activeConnections.toString(),
-                          icon = "🖥️",
+                          title = "أجهزة فريدة",
+                          value = devicesList.size.toString(),
+                          icon = "📱",
                           color = Color(0xFF3182CE),
                           modifier = Modifier.weight(1f)
                       )
                       StatCard(
-                          title = "إجمالي الطلبات",
-                          value = totalRequests.toString(),
-                          icon = "🔢",
+                          title = "اتصالات نشطة",
+                          value = activeConnections.toString(),
+                          icon = "🔗",
                           color = Color(0xFF805AD5),
                           modifier = Modifier.weight(1f)
                       )
@@ -900,19 +947,101 @@ jobs:
                       horizontalArrangement = Arrangement.spacedBy(10.dp)
                   ) {
                       StatCard(
-                          title = "تحميل",
+                          title = "إجمالي الطلبات",
+                          value = totalRequests.toString(),
+                          icon = "🔢",
+                          color = Color(0xFF805AD5),
+                          modifier = Modifier.weight(1f)
+                      )
+                      StatCard(
+                          title = "التنزيل",
                           value = ProxyStats.formatBytes(bytesReceived),
                           icon = "📥",
                           color = Color(0xFF38A169),
                           modifier = Modifier.weight(1f)
                       )
+                  }
+
+                  Row(
+                      modifier = Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.spacedBy(10.dp)
+                  ) {
                       StatCard(
-                          title = "رفع",
+                          title = "الرفع",
                           value = ProxyStats.formatBytes(bytesSent),
                           icon = "📤",
                           color = Color(0xFFED8936),
                           modifier = Modifier.weight(1f)
                       )
+                      Spacer(modifier = Modifier.weight(1f))
+                  }
+
+                  Card(
+                      modifier = Modifier.fillMaxWidth(),
+                      shape = RoundedCornerShape(16.dp),
+                      colors = CardDefaults.cardColors(containerColor = Color.White)
+                  ) {
+                      Column(modifier = Modifier.padding(16.dp)) {
+                          Text("📱 الأجهزة المتصلة (${devicesList.size})",
+                              fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                          Spacer(Modifier.height(10.dp))
+
+                          if (devicesList.isEmpty()) {
+                              Text(
+                                  "لا توجد أجهزة بعد. شغّل بروكسي وابدأ التصفح.",
+                                  fontSize = 12.sp, color = Color(0xFF94A3B8),
+                                  modifier = Modifier.padding(vertical = 20.dp)
+                              )
+                          } else {
+                              devicesList.forEach { device ->
+                                  Column(
+                                      modifier = Modifier
+                                          .fillMaxWidth()
+                                          .padding(vertical = 8.dp)
+                                  ) {
+                                      Row(
+                                          modifier = Modifier.fillMaxWidth(),
+                                          horizontalArrangement = Arrangement.SpaceBetween,
+                                          verticalAlignment = Alignment.CenterVertically
+                                      ) {
+                                          Text(
+                                              "📱 ${device.ip}",
+                                              fontSize = 13.sp,
+                                              fontWeight = FontWeight.Bold,
+                                              color = Color(0xFF1E293B)
+                                          )
+                                          Text(
+                                              timeFormat.format(Date(device.lastSeen)),
+                                              fontSize = 10.sp,
+                                              color = Color(0xFF94A3B8)
+                                          )
+                                      }
+                                      Spacer(Modifier.height(4.dp))
+                                      Row(
+                                          modifier = Modifier.fillMaxWidth(),
+                                          horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                      ) {
+                                          Text(
+                                              "🔢 ${device.requestCount}",
+                                              fontSize = 10.sp,
+                                              color = Color(0xFF64748B)
+                                          )
+                                          Text(
+                                              "📥 ${ProxyStats.formatBytes(device.bytesReceived)}",
+                                              fontSize = 10.sp,
+                                              color = Color(0xFF38A169)
+                                          )
+                                          Text(
+                                              "📤 ${ProxyStats.formatBytes(device.bytesSent)}",
+                                              fontSize = 10.sp,
+                                              color = Color(0xFFED8936)
+                                          )
+                                      }
+                                  }
+                                  HorizontalDivider(color = Color(0xFFE2E8F0), thickness = 0.5.dp)
+                              }
+                          }
+                      }
                   }
 
                   Card(
@@ -927,12 +1056,12 @@ jobs:
 
                           if (recentRequests.isEmpty()) {
                               Text(
-                                  "لا توجد طلبات بعد. شغّل بروكسي وابدأ التصفح.",
+                                  "لا توجد طلبات بعد.",
                                   fontSize = 12.sp, color = Color(0xFF94A3B8),
                                   modifier = Modifier.padding(vertical = 20.dp)
                               )
                           } else {
-                              recentRequests.take(30).forEach { req ->
+                              recentRequests.take(20).forEach { req ->
                                   Row(
                                       modifier = Modifier
                                           .fillMaxWidth()
