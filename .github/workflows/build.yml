@@ -290,6 +290,8 @@ jobs:
               ) {
                   val mgr = manager ?: return onFailure("WiFi Direct غير مدعوم")
                   if (!hasPermission()) return onFailure("يحتاج إذن WiFi Direct")
+
+                  channel = null
                   val ch = ensureChannel() ?: return onFailure("فشل تهيئة القناة")
 
                   val cleanSuffix = suffix.trim().replace(Regex("[^A-Za-z0-9_-]"), "").take(20)
@@ -300,6 +302,24 @@ jobs:
                       return
                   }
 
+                  try {
+                      mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                          override fun onSuccess() { doCreate(mgr, ch, ssid, password, onSuccess, onFailure) }
+                          override fun onFailure(reason: Int) { doCreate(mgr, ch, ssid, password, onSuccess, onFailure) }
+                      })
+                  } catch (e: Exception) {
+                      doCreate(mgr, ch, ssid, password, onSuccess, onFailure)
+                  }
+              }
+
+              private fun doCreate(
+                  mgr: WifiP2pManager,
+                  ch: WifiP2pManager.Channel,
+                  ssid: String,
+                  password: String,
+                  onSuccess: (String, String) -> Unit,
+                  onFailure: (String) -> Unit
+              ) {
                   try {
                       val config = WifiP2pConfig.Builder()
                           .setNetworkName(ssid)
@@ -313,39 +333,49 @@ jobs:
                           WifiP2pManager.ActionListener::class.java
                       )
 
-                      val listener = object : WifiP2pManager.ActionListener {
+                      method.invoke(mgr, ch, config, object : WifiP2pManager.ActionListener {
                           override fun onSuccess() {
                               Handler(context.mainLooper).postDelayed({
                                   mgr.requestGroupInfo(ch) { group: WifiP2pGroup? ->
                                       if (group == null) onFailure("لم يتم إنشاء المجموعة")
                                       else onSuccess(group.networkName ?: ssid, group.passphrase ?: password)
                                   }
-                              }, 1500)
+                              }, 2000)
                           }
-                          override fun onFailure(reason: Int) { onFailure(translate(reason)) }
-                      }
-
-                      method.invoke(mgr, ch, config, listener)
-                  } catch (e: NoSuchMethodException) {
-                      try {
-                          mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
-                              override fun onSuccess() {
-                                  Handler(context.mainLooper).postDelayed({
-                                      mgr.requestGroupInfo(ch) { group: WifiP2pGroup? ->
-                                          if (group == null) onFailure("لم يتم إنشاء المجموعة")
-                                          else onSuccess(group.networkName ?: "DIRECT-XX", group.passphrase ?: "")
-                                      }
-                                  }, 1500)
-                              }
-                              override fun onFailure(reason: Int) { onFailure(translate(reason)) }
-                          })
-                      } catch (ex: Exception) {
-                          onFailure("فشل: ${ex.message}")
-                      }
-                  } catch (e: SecurityException) {
-                      onFailure("صلاحية مرفوضة")
+                          override fun onFailure(reason: Int) {
+                              fallbackCreate(mgr, ch, ssid, password, onSuccess, onFailure, translate(reason))
+                          }
+                      })
                   } catch (e: Exception) {
-                      onFailure("خطأ: ${e.message}")
+                      fallbackCreate(mgr, ch, ssid, password, onSuccess, onFailure, e.message ?: "خطأ")
+                  }
+              }
+
+              private fun fallbackCreate(
+                  mgr: WifiP2pManager,
+                  ch: WifiP2pManager.Channel,
+                  ssid: String,
+                  password: String,
+                  onSuccess: (String, String) -> Unit,
+                  onFailure: (String) -> Unit,
+                  firstError: String
+              ) {
+                  try {
+                      mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
+                          override fun onSuccess() {
+                              Handler(context.mainLooper).postDelayed({
+                                  mgr.requestGroupInfo(ch) { group: WifiP2pGroup? ->
+                                      if (group == null) onFailure("لم يتم إنشاء المجموعة — أغلق WiFi وحاول مرة أخرى")
+                                      else onSuccess(group.networkName ?: ssid, group.passphrase ?: password)
+                                  }
+                              }, 2000)
+                          }
+                          override fun onFailure(reason: Int) {
+                              onFailure("$firstError | ${translate(reason)}")
+                          }
+                      })
+                  } catch (ex: Exception) {
+                      onFailure("فشل: ${ex.message}")
                   }
               }
 
@@ -361,10 +391,10 @@ jobs:
               }
 
               private fun translate(r: Int): String = when (r) {
-                  WifiP2pManager.BUSY -> "WiFi Direct مشغول — أغلق Hotspot وانتظر 10 ثوان"
-                  WifiP2pManager.ERROR -> "خطأ داخلي — جرّب إعادة تشغيل WiFi"
-                  WifiP2pManager.P2P_UNSUPPORTED -> "غير مدعوم على هذا الجهاز"
-                  else -> "فشل: كود $r"
+                  WifiP2pManager.BUSY -> "WiFi Direct مشغول"
+                  WifiP2pManager.ERROR -> "خطأ داخلي"
+                  WifiP2pManager.P2P_UNSUPPORTED -> "غير مدعوم"
+                  else -> "كود $r"
               }
           }
           EOF
@@ -788,7 +818,7 @@ jobs:
                               Spacer(Modifier.height(12.dp))
                               Text("SSID: $ssid", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                               Spacer(Modifier.height(4.dp))
-                              Text("كلمة المرور: $pass", color = Color.White.copy(alpha = 0.9f), fontSize = 13.sp)
+                              Text("كلمة المرور: $pass", color = Color.White, fontSize = 14.sp)
                           }
                       }
                   }
@@ -799,7 +829,6 @@ jobs:
 
                   OutlinedTextField(value = password, onValueChange = { password = it.take(30) },
                       label = { Text("كلمة المرور (8+ أحرف)", fontSize = 12.sp) },
-                      visualTransformation = PasswordVisualTransformation(),
                       modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !isRunning)
 
                   Button(onClick = {
@@ -824,7 +853,21 @@ jobs:
 
                   err?.let { Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp),
                       colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE5E5))) {
-                      Text("⚠️ $it", modifier = Modifier.padding(14.dp), fontSize = 12.sp, color = Color(0xFF9B2C2C))
+                      Column(modifier = Modifier.padding(14.dp)) {
+                          Text("⚠️ $it", fontSize = 12.sp, color = Color(0xFF9B2C2C), fontWeight = FontWeight.Bold)
+                          Spacer(Modifier.height(8.dp))
+                          Text("💡 جرّب: أطفئ WiFi ثم أعد المحاولة", fontSize = 11.sp, color = Color(0xFF9B2C2C))
+                          Spacer(Modifier.height(8.dp))
+                          Button(onClick = {
+                              val intendedSsid = "DIRECT-FL-" + suffix.trim().ifEmpty { "Net" }
+                              ssid = intendedSsid
+                              pass = password
+                              qr = QrCodeGenerator.generateWifiQr(intendedSsid, password)
+                              info = "📷 الباركود معروض — لكن الشبكة لم تُنشأ بعد"
+                          }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDD6B20))) {
+                              Text("📷 اعرض الباركود على أي حال", fontSize = 11.sp)
+                          }
+                      }
                   } }
 
                   info?.let { Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp),
@@ -832,7 +875,7 @@ jobs:
                       Text(it, modifier = Modifier.padding(14.dp), fontSize = 12.sp, color = Color(0xFF234E52), fontWeight = FontWeight.Bold)
                   } }
 
-                  if (isRunning && qr != null) {
+                  if (qr != null) {
                       Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
                            colors = CardDefaults.cardColors(containerColor = Color.White)) {
                           Column(modifier = Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -840,8 +883,8 @@ jobs:
                               Spacer(Modifier.height(12.dp))
                               Image(bitmap = qr!!.asImageBitmap(), contentDescription = "QR", modifier = Modifier.size(220.dp))
                               Spacer(Modifier.height(12.dp))
-                              Text(ssid, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                              Text("كلمة المرور: $pass", fontSize = 11.sp, color = Color(0xFF64748B))
+                              Text(ssid, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                              Text("كلمة المرور: $pass", fontSize = 12.sp, color = Color(0xFF64748B))
                           }
                       }
                   }
