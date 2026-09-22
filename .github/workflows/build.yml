@@ -71,7 +71,7 @@ jobs:
               compileSdk 34
               defaultConfig {
                   applicationId "com.flownet.app"
-                  minSdk 26
+                  minSdk 29
                   targetSdk 34
                   versionCode 1
                   versionName "1.0"
@@ -89,6 +89,7 @@ jobs:
               implementation platform('androidx.compose:compose-bom:2024.09.03')
               implementation 'androidx.compose.ui:ui'
               implementation 'androidx.compose.material3:material3'
+              implementation 'com.google.zxing:core:3.5.3'
           }
           EOF
           
@@ -97,6 +98,10 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -181,7 +186,7 @@ jobs:
           import java.net.Inet4Address
           import java.net.NetworkInterface
 
-          data class NetworkIp(val label: String, val ip: String, val emoji: String, val isPermanent: Boolean = false)
+          data class NetworkIp(val label: String, val ip: String, val emoji: String, val isPermanent: Boolean = false, val ifaceName: String = "")
 
           fun getAllNetworkIps(): List<NetworkIp> {
               val r = mutableListOf<NetworkIp>()
@@ -200,15 +205,174 @@ jobs:
                           if (ip in seen) continue
                           seen.add(ip)
                           r.add(when {
-                              name.startsWith("p2p") || ip.startsWith("192.168.49.") -> NetworkIp("WiFi Direct", ip, "📡", true)
-                              ip.startsWith("192.168.43.") -> NetworkIp("Hotspot", ip, "🔥")
-                              ip.startsWith("192.168.42.") -> NetworkIp("USB", ip, "🔌")
-                              else -> NetworkIp("WiFi / LAN", ip, "📶")
+                              name.startsWith("p2p") || ip.startsWith("192.168.49.") -> NetworkIp("WiFi Direct", ip, "📡", true, name)
+                              ip.startsWith("192.168.43.") -> NetworkIp("Hotspot", ip, "🔥", false, name)
+                              ip.startsWith("192.168.42.") -> NetworkIp("USB", ip, "🔌", false, name)
+                              else -> NetworkIp("WiFi / LAN", ip, "📶", false, name)
                           })
                       }
                   }
               } catch (e: Exception) {}
               return r.sortedWith(compareByDescending<NetworkIp> { it.isPermanent }.thenBy { it.ip })
+          }
+
+          fun getLocalIpAddress(): String = getAllNetworkIps().firstOrNull()?.ip ?: "غير متاح"
+          EOF
+          
+          cat > app/src/main/java/com/flownet/app/QrCodeGenerator.kt << 'EOF'
+          package com.flownet.app
+
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import com.google.zxing.BarcodeFormat
+          import com.google.zxing.EncodeHintType
+          import com.google.zxing.qrcode.QRCodeWriter
+          import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+
+          object QrCodeGenerator {
+              fun generateWifiQr(ssid: String, password: String, size: Int = 600): Bitmap? = try {
+                  val content = if (password.isEmpty()) "WIFI:S:$ssid;T:nopass;;"
+                                else "WIFI:S:$ssid;T:WPA;P:$password;;"
+                  val hints = mapOf(
+                      EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,
+                      EncodeHintType.CHARACTER_SET to "UTF-8",
+                      EncodeHintType.MARGIN to 1
+                  )
+                  val m = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, size, size, hints)
+                  val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
+                  for (x in 0 until size) for (y in 0 until size)
+                      bmp.setPixel(x, y, if (m.get(x, y)) Color.BLACK else Color.WHITE)
+                  bmp
+              } catch (e: Exception) { e.printStackTrace(); null }
+          }
+          EOF
+          
+          cat > app/src/main/java/com/flownet/app/WifiDirectManager.kt << 'EOF'
+          package com.flownet.app
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.net.wifi.p2p.WifiP2pConfig
+          import android.net.wifi.p2p.WifiP2pGroup
+          import android.net.wifi.p2p.WifiP2pManager
+          import android.os.Build
+          import android.os.Handler
+          import androidx.core.content.ContextCompat
+          import java.lang.reflect.Method
+
+          class WifiDirectManager(private val context: Context) {
+
+              private val manager: WifiP2pManager? =
+                  context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+              private var channel: WifiP2pManager.Channel? = null
+
+              fun isSupported(): Boolean = manager != null
+
+              fun hasPermission(): Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                  ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
+              } else {
+                  ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+              }
+
+              private fun ensureChannel(): WifiP2pManager.Channel? {
+                  if (channel == null && manager != null) {
+                      channel = manager.initialize(context, context.mainLooper, null)
+                  }
+                  return channel
+              }
+
+              @SuppressLint("MissingPermission")
+              fun createCustomGroup(
+                  suffix: String,
+                  password: String,
+                  onSuccess: (ssid: String, pass: String) -> Unit,
+                  onFailure: (String) -> Unit
+              ) {
+                  val mgr = manager ?: return onFailure("WiFi Direct غير مدعوم")
+                  if (!hasPermission()) return onFailure("يحتاج إذن WiFi Direct")
+                  val ch = ensureChannel() ?: return onFailure("فشل تهيئة القناة")
+
+                  val cleanSuffix = suffix.trim().replace(Regex("[^A-Za-z0-9_-]"), "").take(20)
+                  val ssid = "DIRECT-FL-" + cleanSuffix.ifEmpty { "Net" }
+
+                  if (password.length < 8) {
+                      onFailure("كلمة المرور يجب أن تكون 8 أحرف على الأقل")
+                      return
+                  }
+
+                  try {
+                      val config = WifiP2pConfig.Builder()
+                          .setNetworkName(ssid)
+                          .setPassphrase(password)
+                          .build()
+
+                      val method: Method = mgr.javaClass.getMethod(
+                          "createGroup",
+                          WifiP2pManager.Channel::class.java,
+                          WifiP2pConfig::class.java,
+                          WifiP2pManager.ActionListener::class.java
+                      )
+
+                      val listener = object : WifiP2pManager.ActionListener {
+                          override fun onSuccess() {
+                              Handler(context.mainLooper).postDelayed({
+                                  mgr.requestGroupInfo(ch) { group: WifiP2pGroup? ->
+                                      if (group == null) onFailure("لم يتم إنشاء المجموعة")
+                                      else onSuccess(group.networkName ?: ssid, group.passphrase ?: password)
+                                  }
+                              }, 1500)
+                          }
+                          override fun onFailure(reason: Int) { onFailure(translate(reason)) }
+                      }
+
+                      method.invoke(mgr, ch, config, listener)
+                  } catch (e: NoSuchMethodException) {
+                      try {
+                          mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
+                              override fun onSuccess() {
+                                  Handler(context.mainLooper).postDelayed({
+                                      mgr.requestGroupInfo(ch) { group: WifiP2pGroup? ->
+                                          if (group == null) onFailure("لم يتم إنشاء المجموعة")
+                                          else onSuccess(group.networkName ?: "DIRECT-XX", group.passphrase ?: "")
+                                      }
+                                  }, 1500)
+                              }
+                              override fun onFailure(reason: Int) { onFailure(translate(reason)) }
+                          })
+                      } catch (ex: Exception) {
+                          onFailure("فشل: ${ex.message}")
+                      }
+                  } catch (e: SecurityException) {
+                      onFailure("صلاحية مرفوضة")
+                  } catch (e: Exception) {
+                      onFailure("خطأ: ${e.message}")
+                  }
+              }
+
+              fun removeGroup(onDone: () -> Unit = {}) {
+                  val mgr = manager ?: return onDone()
+                  val ch = channel ?: return onDone()
+                  try {
+                      mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                          override fun onSuccess() { onDone() }
+                          override fun onFailure(reason: Int) { onDone() }
+                      })
+                  } catch (e: Exception) { onDone() }
+              }
+
+              fun reset(onDone: () -> Unit = {}) {
+                  channel = null
+                  removeGroup { channel = ensureChannel(); onDone() }
+              }
+
+              private fun translate(r: Int): String = when (r) {
+                  WifiP2pManager.BUSY -> "WiFi Direct مشغول — أغلق Hotspot وانتظر 10 ثوان"
+                  WifiP2pManager.ERROR -> "خطأ داخلي — جرّب إعادة تشغيل WiFi"
+                  WifiP2pManager.P2P_UNSUPPORTED -> "غير مدعوم على هذا الجهاز"
+                  else -> "فشل: كود $r"
+              }
           }
           EOF
           
@@ -525,10 +689,16 @@ jobs:
           }
           EOF
           
+          echo "✅ الملفات الأساسية جاهزة"
+
+      - name: Create MainActivity
+        run: |
           cat > app/src/main/java/com/flownet/app/MainActivity.kt << 'EOF'
           package com.flownet.app
 
+          import android.Manifest
           import android.content.Intent
+          import android.graphics.Bitmap
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
@@ -537,6 +707,7 @@ jobs:
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.compose.setContent
           import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.Image
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.RoundedCornerShape
@@ -547,6 +718,7 @@ jobs:
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.asImageBitmap
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -575,18 +747,118 @@ jobs:
               Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFFF4F7FC)) {
                   Column(modifier = Modifier.fillMaxSize()) {
                       TabRow(selectedTabIndex = tab, containerColor = Color.White) {
-                          Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("🌐 HTTP", fontSize = 12.sp) })
-                          Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("🔒 SOCKS", fontSize = 12.sp) })
-                          Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("📁 ملفات", fontSize = 12.sp) })
-                          Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("📊 إحصائيات", fontSize = 12.sp) })
+                          Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("🌐 HTTP", fontSize = 11.sp) })
+                          Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("🔒 SOCKS", fontSize = 11.sp) })
+                          Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("📁 ملفات", fontSize = 11.sp) })
+                          Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("📡 Direct", fontSize = 11.sp) })
+                          Tab(selected = tab == 4, onClick = { tab = 4 }, text = { Text("📊", fontSize = 11.sp) })
                       }
                       when (tab) {
                           0 -> HttpScreen(httpRunning, networks, { refresh++ }) { httpRunning = it }
                           1 -> SocksScreen(socksRunning, networks, { refresh++ }) { socksRunning = it }
                           2 -> FilesScreen(filesRunning, networks, { refresh++ }) { filesRunning = it }
-                          3 -> StatsScreen()
+                          3 -> DirectScreen(networks, { refresh++ })
+                          4 -> StatsScreen()
                       }
                   }
+              }
+          }
+
+          @Composable
+          fun DirectScreen(networks: List<NetworkIp>, onRefresh: () -> Unit) {
+              val context = LocalContext.current
+              val mgr = remember { WifiDirectManager(context) }
+              var suffix by rememberSaveable { mutableStateOf("Net") }
+              var password by rememberSaveable { mutableStateOf("flownet123") }
+              var isRunning by rememberSaveable { mutableStateOf(false) }
+              var ssid by rememberSaveable { mutableStateOf("") }
+              var pass by rememberSaveable { mutableStateOf("") }
+              var qr by remember { mutableStateOf<Bitmap?>(null) }
+              var err by remember { mutableStateOf<String?>(null) }
+              var info by remember { mutableStateOf<String?>(null) }
+
+              val permL = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { g ->
+                  if (g) {
+                      mgr.createCustomGroup(suffix, password, { s, p ->
+                          ssid = s; pass = p; isRunning = true; qr = QrCodeGenerator.generateWifiQr(s, p); err = null; info = "✅ الشبكة تعمل"; onRefresh()
+                      }, { e -> err = e })
+                  } else err = "تم رفض الإذن"
+              }
+
+              Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+                     verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                  Text("WiFi Direct", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E293B))
+                  Text("اسم الشبكة: DIRECT-FL-<اللاحقة>", fontSize = 13.sp, color = Color(0xFF64748B))
+
+                  Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
+                       colors = CardDefaults.cardColors(containerColor = if (isRunning) Color(0xFF3182CE) else Color.White)) {
+                      Column(modifier = Modifier.padding(20.dp)) {
+                          Text(if (isRunning) "✅ الشبكة تعمل" else "متوقفة",
+                               color = if (isRunning) Color.White else Color(0xFF1E293B), fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                          if (isRunning) {
+                              Spacer(Modifier.height(12.dp))
+                              Text("SSID: $ssid", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                              Spacer(Modifier.height(4.dp))
+                              Text("كلمة المرور: $pass", color = Color.White.copy(alpha = 0.9f), fontSize = 13.sp)
+                          }
+                      }
+                  }
+
+                  OutlinedTextField(value = suffix, onValueChange = { suffix = it.take(15) },
+                      label = { Text("اللاحقة", fontSize = 12.sp) },
+                      helperText = { Text("الاسم: DIRECT-FL-${suffix.ifEmpty { "Net" }}", fontSize = 10.sp) },
+                      modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !isRunning)
+
+                  OutlinedTextField(value = password, onValueChange = { password = it.take(30) },
+                      label = { Text("كلمة المرور (8+ أحرف)", fontSize = 12.sp) },
+                      visualTransformation = PasswordVisualTransformation(),
+                      modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !isRunning)
+
+                  Button(onClick = {
+                      if (isRunning) {
+                          mgr.removeGroup { isRunning = false; ssid = ""; pass = ""; qr = null; info = null; err = null; onRefresh() }
+                      } else {
+                          err = null; info = null
+                          val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                              Manifest.permission.NEARBY_WIFI_DEVICES else Manifest.permission.ACCESS_FINE_LOCATION
+                          if (mgr.hasPermission()) {
+                              mgr.createCustomGroup(suffix, password, { s, p ->
+                                  ssid = s; pass = p; isRunning = true
+                                  qr = QrCodeGenerator.generateWifiQr(s, p)
+                                  err = null; info = "✅ الشبكة تعمل"; onRefresh()
+                              }, { e -> err = e })
+                          } else permL.launch(perm)
+                      }
+                  }, modifier = Modifier.fillMaxWidth().height(56.dp), shape = RoundedCornerShape(12.dp),
+                     colors = ButtonDefaults.buttonColors(containerColor = if (isRunning) Color(0xFFE53E3E) else Color(0xFF38A169))) {
+                      Text(if (isRunning) "إيقاف" else "🚀 تشغيل WiFi Direct", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                  }
+
+                  err?.let { Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp),
+                      colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE5E5))) {
+                      Text("⚠️ $it", modifier = Modifier.padding(14.dp), fontSize = 12.sp, color = Color(0xFF9B2C2C))
+                  } }
+
+                  info?.let { Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp),
+                      colors = CardDefaults.cardColors(containerColor = Color(0xFFE6FFFA))) {
+                      Text(it, modifier = Modifier.padding(14.dp), fontSize = 12.sp, color = Color(0xFF234E52), fontWeight = FontWeight.Bold)
+                  } }
+
+                  if (isRunning && qr != null) {
+                      Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
+                           colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                          Column(modifier = Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                              Text("📷 امسح للاتصال", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                              Spacer(Modifier.height(12.dp))
+                              Image(bitmap = qr!!.asImageBitmap(), contentDescription = "QR", modifier = Modifier.size(220.dp))
+                              Spacer(Modifier.height(12.dp))
+                              Text(ssid, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                              Text("كلمة المرور: $pass", fontSize = 11.sp, color = Color(0xFF64748B))
+                          }
+                      }
+                  }
+
+                  NetworksCard(networks, onRefresh)
               }
           }
 
@@ -830,8 +1102,7 @@ jobs:
               return n
           }
           EOF
-          
-          echo "✅ المشروع جاهز"
+          echo "✅ MainActivity جاهز"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
@@ -846,3 +1117,4 @@ jobs:
           name: FlowNet-apk-${{ github.run_number }}
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
+          
