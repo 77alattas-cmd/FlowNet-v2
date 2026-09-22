@@ -106,7 +106,6 @@ jobs:
           import kotlinx.coroutines.flow.MutableStateFlow
           import kotlinx.coroutines.flow.StateFlow
           import kotlinx.coroutines.flow.asStateFlow
-          data class RequestLog(val timestamp: Long, val method: String, val host: String, val path: String, val type: String, val size: Long = 0)
           data class DeviceStats(val ip: String, val requestCount: Long = 0, val bytesReceived: Long = 0, val bytesSent: Long = 0, val lastSeen: Long = System.currentTimeMillis())
           object ProxyStats {
               private val _activeConnections = MutableStateFlow(0)
@@ -115,10 +114,6 @@ jobs:
               val bytesReceived: StateFlow<Long> = _bytesReceived.asStateFlow()
               private val _bytesSent = MutableStateFlow(0L)
               val bytesSent: StateFlow<Long> = _bytesSent.asStateFlow()
-              private val _totalRequests = MutableStateFlow(0L)
-              val totalRequests: StateFlow<Long> = _totalRequests.asStateFlow()
-              private val _recentRequests = MutableStateFlow<List<RequestLog>>(emptyList())
-              val recentRequests: StateFlow<List<RequestLog>> = _recentRequests.asStateFlow()
               private val _devices = MutableStateFlow<Map<String, DeviceStats>>(emptyMap())
               val devices: StateFlow<Map<String, DeviceStats>> = _devices.asStateFlow()
               fun connectionOpened() { _activeConnections.value++ }
@@ -126,9 +121,7 @@ jobs:
               fun addBytesReceived(n: Long, ip: String = "unknown") { _bytesReceived.value += n; recordDevice(ip, recv = n) }
               fun addBytesSent(n: Long, ip: String = "unknown") { _bytesSent.value += n; recordDevice(ip, sent = n) }
               fun logRequest(m: String, h: String, p: String, t: String, s: Long = 0, ip: String = "unknown") {
-                  _totalRequests.value++
                   recordDevice(ip, requests = 1)
-                  _recentRequests.value = (listOf(RequestLog(System.currentTimeMillis(), m, h, p, t, s)) + _recentRequests.value).take(50)
               }
               private fun recordDevice(ip: String, requests: Long = 0, recv: Long = 0, sent: Long = 0) {
                   if (ip == "unknown" || ip.isEmpty()) return
@@ -136,7 +129,7 @@ jobs:
                   val e = c[ip] ?: DeviceStats(ip = ip)
                   _devices.value = c + (ip to e.copy(requestCount = e.requestCount + requests, bytesReceived = e.bytesReceived + recv, bytesSent = e.bytesSent + sent, lastSeen = System.currentTimeMillis()))
               }
-              fun reset() { _bytesReceived.value = 0; _bytesSent.value = 0; _totalRequests.value = 0; _recentRequests.value = emptyList(); _devices.value = emptyMap() }
+              fun reset() { _bytesReceived.value = 0; _bytesSent.value = 0; _devices.value = emptyMap() }
               fun formatBytes(b: Long): String = when {
                   b < 1024 -> "$b B"
                   b < 1048576 -> String.format("%.1f KB", b / 1024.0)
@@ -194,18 +187,14 @@ jobs:
                   val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
                   for (x in 0 until size) for (y in 0 until size) bmp.setPixel(x, y, if (m.get(x, y)) Color.BLACK else Color.WHITE)
                   bmp
-              } catch (e: Exception) { e.printStackTrace(); null }
+              } catch (e: Exception) { null }
           }
           EOF
           cat > app/src/main/java/com/flownet/app/WifiDirectManager.kt << 'EOF'
           package com.flownet.app
-
           import android.Manifest
           import android.annotation.SuppressLint
-          import android.content.BroadcastReceiver
           import android.content.Context
-          import android.content.Intent
-          import android.content.IntentFilter
           import android.content.pm.PackageManager
           import android.net.wifi.p2p.WifiP2pConfig
           import android.net.wifi.p2p.WifiP2pGroup
@@ -214,79 +203,32 @@ jobs:
           import android.os.Handler
           import android.os.Looper
           import androidx.core.content.ContextCompat
-
           class WifiDirectManager(private val context: Context) {
-
-              private val manager: WifiP2pManager? =
-                  context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+              private val manager: WifiP2pManager? = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
               private var channel: WifiP2pManager.Channel? = null
-              private var receiverRegistered = false
-
-              private val receiver = object : BroadcastReceiver() {
-                  override fun onReceive(ctx: Context?, intent: Intent?) { }
-              }
-
-              fun register() {
-                  if (!receiverRegistered) {
-                      try {
-                          val filter = IntentFilter().apply {
-                              addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
-                              addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
-                              addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
-                              addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION)
-                          }
-                          context.registerReceiver(receiver, filter)
-                          receiverRegistered = true
-                      } catch (e: Exception) { }
-                  }
-              }
-
-              fun unregister() {
-                  if (receiverRegistered) {
-                      try { context.unregisterReceiver(receiver) } catch (e: Exception) { }
-                      receiverRegistered = false
-                  }
-              }
-
-              fun isSupported(): Boolean = manager != null
-
               fun hasPermission(): Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                   ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
               } else {
                   ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
               }
-
               private fun ensureChannel(): WifiP2pManager.Channel? {
-                  if (channel == null && manager != null) {
-                      channel = manager.initialize(context, context.mainLooper, null)
-                  }
+                  if (channel == null && manager != null) channel = manager.initialize(context, context.mainLooper, null)
                   return channel
               }
-
               @SuppressLint("MissingPermission")
               fun createGroup(onSuccess: (String, String) -> Unit, onFailure: (String) -> Unit) {
-                  register()
                   val mgr = manager ?: return onFailure("WiFi Direct غير متوفر")
                   if (!hasPermission()) return onFailure("يحتاج إذن WiFi Direct")
                   channel = null
                   val ch = ensureChannel() ?: return onFailure("فشل تهيئة القناة")
-
                   try {
                       mgr.discoverPeers(ch, object : WifiP2pManager.ActionListener {
                           override fun onSuccess() { cleanup(mgr, ch, onSuccess, onFailure) }
                           override fun onFailure(reason: Int) { cleanup(mgr, ch, onSuccess, onFailure) }
                       })
-                  } catch (e: Exception) {
-                      cleanup(mgr, ch, onSuccess, onFailure)
-                  }
+                  } catch (e: Exception) { cleanup(mgr, ch, onSuccess, onFailure) }
               }
-
-              private fun cleanup(
-                  mgr: WifiP2pManager,
-                  ch: WifiP2pManager.Channel,
-                  onSuccess: (String, String) -> Unit,
-                  onFailure: (String) -> Unit
-              ) {
+              private fun cleanup(mgr: WifiP2pManager, ch: WifiP2pManager.Channel, onSuccess: (String, String) -> Unit, onFailure: (String) -> Unit) {
                   Handler(Looper.getMainLooper()).postDelayed({
                       try {
                           mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
@@ -294,87 +236,50 @@ jobs:
                               override fun onFailure(reason: Int) { attemptCreate(mgr, ch, onSuccess, onFailure, 0) }
                           })
                       } catch (e: Exception) { attemptCreate(mgr, ch, onSuccess, onFailure, 0) }
-                  }, 1200)
+                  }, 1500)
               }
-
-              private fun attemptCreate(
-                  mgr: WifiP2pManager,
-                  ch: WifiP2pManager.Channel,
-                  onSuccess: (String, String) -> Unit,
-                  onFailure: (String) -> Unit,
-                  attempt: Int
-              ) {
+              private fun attemptCreate(mgr: WifiP2pManager, ch: WifiP2pManager.Channel, onSuccess: (String, String) -> Unit, onFailure: (String) -> Unit, attempt: Int) {
                   try {
-                      val config = WifiP2pConfig.Builder().build()
+                      val config = WifiP2pConfig()
                       config.groupOwnerIntent = 15
-
                       val listener = object : WifiP2pManager.ActionListener {
                           override fun onSuccess() {
                               Handler(Looper.getMainLooper()).postDelayed({
                                   readGroup(mgr, ch, onSuccess, onFailure, attempt)
-                              }, 2500)
+                              }, 3000)
                           }
                           override fun onFailure(reason: Int) {
-                              if (attempt < 2) {
+                              if (attempt < 3) {
                                   Handler(Looper.getMainLooper()).postDelayed({
                                       attemptCreate(mgr, ch, onSuccess, onFailure, attempt + 1)
-                                  }, 2500)
-                              } else {
-                                  onFailure(explainError(reason))
-                              }
+                                  }, 3000)
+                              } else onFailure(explainError(reason))
                           }
                       }
-
-                      var invoked = false
-                      try {
-                          val method = mgr.javaClass.getMethod(
-                              "createGroup",
-                              WifiP2pManager.Channel::class.java,
-                              WifiP2pConfig::class.java,
-                              WifiP2pManager.ActionListener::class.java
-                          )
-                          method.invoke(mgr, ch, config, listener)
-                          invoked = true
-                      } catch (e: Exception) { }
-
-                      if (!invoked) {
-                          mgr.createGroup(ch, listener)
-                      }
+                      mgr.createGroup(ch, listener)
                   } catch (e: Exception) {
-                      if (attempt < 2) {
+                      if (attempt < 3) {
                           Handler(Looper.getMainLooper()).postDelayed({
                               attemptCreate(mgr, ch, onSuccess, onFailure, attempt + 1)
-                          }, 2500)
-                      } else {
-                          onFailure("فشل: ${e.message}")
-                      }
+                          }, 3000)
+                      } else onFailure("فشل: ${e.message}")
                   }
               }
-
-              private fun readGroup(
-                  mgr: WifiP2pManager,
-                  ch: WifiP2pManager.Channel,
-                  onSuccess: (String, String) -> Unit,
-                  onFailure: (String) -> Unit,
-                  attempt: Int
-              ) {
+              private fun readGroup(mgr: WifiP2pManager, ch: WifiP2pManager.Channel, onSuccess: (String, String) -> Unit, onFailure: (String) -> Unit, attempt: Int) {
                   try {
                       mgr.requestGroupInfo(ch) { group: WifiP2pGroup? ->
                           if (group == null) {
-                              if (attempt < 2) attemptCreate(mgr, ch, onSuccess, onFailure, attempt + 1)
-                              else onFailure("لم تُنشأ المجموعة — أعد تشغيل WiFi")
+                              if (attempt < 3) attemptCreate(mgr, ch, onSuccess, onFailure, attempt + 1)
+                              else onFailure("لم تُنشأ المجموعة")
                           } else {
-                              val ssid = group.networkName ?: "DIRECT-FL"
-                              val pass = group.passphrase ?: "12345678"
-                              onSuccess(ssid, pass)
+                              onSuccess(group.networkName ?: "DIRECT-FL", group.passphrase ?: "12345678")
                           }
                       }
                   } catch (e: Exception) {
-                      if (attempt < 2) attemptCreate(mgr, ch, onSuccess, onFailure, attempt + 1)
+                      if (attempt < 3) attemptCreate(mgr, ch, onSuccess, onFailure, attempt + 1)
                       else onFailure("فشل قراءة الشبكة")
                   }
               }
-
               fun removeGroup(onDone: () -> Unit = {}) {
                   val mgr = manager ?: return onDone()
                   val ch = channel ?: return onDone()
@@ -385,11 +290,10 @@ jobs:
                       })
                   } catch (e: Exception) { onDone() }
               }
-
               private fun explainError(reason: Int): String = when (reason) {
-                  WifiP2pManager.BUSY -> "WiFi Direct مشغول — أغلق Hotspot"
-                  WifiP2pManager.ERROR -> "خطأ — أعد تشغيل WiFi وحاول مرة أخرى"
-                  WifiP2pManager.P2P_UNSUPPORTED -> "غير مدعوم على هذا الجهاز"
+                  WifiP2pManager.BUSY -> "مشغول — أغلق Hotspot"
+                  WifiP2pManager.ERROR -> "خطأ — أعد تشغيل WiFi"
+                  WifiP2pManager.P2P_UNSUPPORTED -> "غير مدعوم"
                   else -> "فشل بكود $reason"
               }
           }
@@ -424,7 +328,7 @@ jobs:
                               val c = ss?.accept() ?: break
                               Thread { handle(c) }.start()
                           }
-                      } catch (e: Exception) { e.printStackTrace() }
+                      } catch (e: Exception) {}
                   }.also { it.start() }
                   return START_STICKY
               }
@@ -451,7 +355,7 @@ jobs:
                               else -> o.write("HTTP/1.1 404 Not Found\r\n\r\n".toByteArray())
                           }
                           o.flush()
-                      } catch (e: Exception) { e.printStackTrace() }
+                      } catch (e: Exception) {}
                   }
               }
               private fun serve(o: OutputStream, uri: Uri, cip: String) {
@@ -464,7 +368,7 @@ jobs:
                       o.write(b)
                       ProxyStats.addBytesSent(b.size.toLong(), cip)
                       ProxyStats.logRequest("GET", "fileserver", "/$fn", "FILES", b.size.toLong(), cip)
-                  } catch (e: Exception) { e.printStackTrace() }
+                  } catch (e: Exception) {}
               }
               private fun fname(uri: Uri): String {
                   var n = "file"
@@ -474,7 +378,7 @@ jobs:
               private fun html(): String {
                   val lst = files.mapIndexed { i, u -> "<li><a href=\"/file/$i\">📄 ${fname(u)}</a></li>" }.joinToString("")
                   val body = if (files.isEmpty()) "<p>لا توجد ملفات</p>" else "<ul>$lst</ul>"
-                  return "<!DOCTYPE html><html dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>FlowNet</title><style>body{font-family:sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;padding:20px;margin:0}.c{background:#fff;border-radius:24px;padding:24px;max-width:600px;margin:0 auto}h1{color:#667eea;text-align:center}ul{list-style:none;padding:0}li{padding:16px;margin:8px 0;background:#f8fafc;border-radius:16px}a{color:#1e293b;text-decoration:none;font-weight:bold}</style></head><body><div class='c'><h1>🌐 FlowNet</h1>$body</div></body></html>"
+                  return "<!DOCTYPE html><html dir='rtl'><head><meta charset='utf-8'><title>FlowNet</title><style>body{font-family:sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;padding:20px;margin:0}.c{background:#fff;border-radius:24px;padding:24px;max-width:600px;margin:0 auto}h1{color:#667eea;text-align:center}ul{list-style:none;padding:0}li{padding:16px;margin:8px 0;background:#f8fafc;border-radius:16px}a{color:#1e293b;text-decoration:none;font-weight:bold}</style></head><body><div class='c'><h1>🌐 FlowNet</h1>$body</div></body></html>"
               }
               private fun notif(): Notification {
                   val c = "fs"
@@ -513,7 +417,7 @@ jobs:
                       try {
                           ss = ServerSocket(port)
                           while (!Thread.currentThread().isInterrupted) { val c = ss?.accept() ?: break; pool.execute { handle(c) } }
-                      } catch (e: Exception) { e.printStackTrace() }
+                      } catch (e: Exception) {}
                   }.also { it.start() }
                   return START_STICKY
               }
@@ -556,7 +460,7 @@ jobs:
                               try { out.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0)); out.flush() } catch (ex: Exception) {}
                           } finally { try { t?.close() } catch (e: Exception) {} }
                       }
-                  } catch (e: Exception) { e.printStackTrace() } finally { ProxyStats.connectionClosed() }
+                  } catch (e: Exception) {} finally { ProxyStats.connectionClosed() }
               }
               private fun relay(i: InputStream, o: OutputStream, up: Boolean, ip: String) {
                   try { val b = ByteArray(8192); while (!Thread.currentThread().isInterrupted) { val n = i.read(b); if (n <= 0) break; o.write(b, 0, n); o.flush(); if (up) ProxyStats.addBytesSent(n.toLong(), ip) else ProxyStats.addBytesReceived(n.toLong(), ip) } } catch (e: Exception) {}
@@ -597,7 +501,7 @@ jobs:
                       try {
                           ss = ServerSocket(port)
                           while (!Thread.currentThread().isInterrupted) { val c = ss?.accept() ?: break; pool.execute { handle(c) } }
-                      } catch (e: Exception) { e.printStackTrace() }
+                      } catch (e: Exception) {}
                   }.also { it.start() }
                   return START_STICKY
               }
@@ -631,3 +535,44 @@ jobs:
                                       if (ci >= 0 && d.substring(ci + 1) == pw) ok = true
                                   } catch (e: Exception) {}
                               }
+                              if (!ok) { o.write("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"FlowNet\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray()); o.flush(); return }
+                          }
+                          if (m.equals("CONNECT", true)) {
+                              val hp = u.split(":"); val h = hp[0]; val tp = hp.getOrNull(1)?.toIntOrNull() ?: 443
+                              ProxyStats.logRequest("CONNECT", h, ":$tp", "HTTP", 0, cip)
+                              val t = Socket(); t.connect(InetSocketAddress(h, tp), 15000)
+                              o.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray()); o.flush()
+                              val t1 = Thread { relay(s.getInputStream(), t.getOutputStream(), true, cip) }
+                              val t2 = Thread { relay(t.getInputStream(), s.getOutputStream(), false, cip) }
+                              t1.start(); t2.start(); t1.join(); t2.join()
+                              try { t.close() } catch (e: Exception) {}
+                          } else {
+                              val uri = URI(u); val h = uri.host ?: return
+                              val tp = if (uri.port > 0) uri.port else 80
+                              val path = (uri.rawPath ?: "/") + (uri.rawQuery?.let { "?$it" } ?: "")
+                              ProxyStats.logRequest(m, h, path, "HTTP", 0, cip)
+                              val t = Socket(); t.connect(InetSocketAddress(h, tp), 15000)
+                              val to = t.getOutputStream()
+                              val sb = StringBuilder(); sb.append("$m $path HTTP/1.1\r\nHost: $h\r\n")
+                              hs.forEach { (k, v) -> if (!k.equals("Proxy-Connection", true) && !k.equals("Connection", true)) sb.append("$k: $v\r\n") }
+                              sb.append("Connection: close\r\n\r\n")
+                              to.write(sb.toString().toByteArray()); to.flush()
+                              relay(t.getInputStream(), o, false, cip)
+                              try { t.close() } catch (e: Exception) {}
+                          }
+                      }
+                  } catch (e: Exception) {} finally { ProxyStats.connectionClosed() }
+              }
+              private fun relay(i: InputStream, o: OutputStream, up: Boolean, ip: String) {
+                  try { val b = ByteArray(8192); while (!Thread.currentThread().isInterrupted) { val n = i.read(b); if (n <= 0) break; o.write(b, 0, n); o.flush(); if (up) ProxyStats.addBytesSent(n.toLong(), ip) else ProxyStats.addBytesReceived(n.toLong(), ip) } } catch (e: Exception) {}
+              }
+              private fun notif(): Notification {
+                  val c = "h"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(c, "FlowNet HTTP", NotificationManager.IMPORTANCE_LOW))
+                  return NotificationCompat.Builder(this, c).setContentTitle("FlowNet HTTP").setContentText("منفذ $port").setSmallIcon(android.R.drawable.ic_menu_share).setOngoing(true).build()
+              }
+              override fun onBind(i: Intent?): IBinder? = null
+              override fun onDestroy() { th?.interrupt(); try { ss?.close() } catch (e: Exception) {}; pool.shutdownNow(); super.onDestroy() }
+          }
+          EOF
+          cat > app/src/main/java/com/flownet/app/MainActivity.kt <<
